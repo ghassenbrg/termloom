@@ -18,12 +18,20 @@ use termloom::services::dap::{
 
 /// Locate `lldb-dap`, including inside the active Xcode toolchain.
 fn find_adapter() -> Option<String> {
+    // As with rust-analyzer, a file on PATH is not proof of a usable binary:
+    // probe it before making the test depend on it.
     if let Some(paths) = std::env::var_os("PATH") {
         if let Some(found) = std::env::split_paths(&paths)
             .map(|dir| dir.join("lldb-dap"))
             .find(|path| path.is_file())
         {
-            return Some(found.to_string_lossy().to_string());
+            let usable = Command::new(&found)
+                .arg("--help")
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if usable {
+                return Some(found.to_string_lossy().to_string());
+            }
         }
     }
     let output = Command::new("xcrun")

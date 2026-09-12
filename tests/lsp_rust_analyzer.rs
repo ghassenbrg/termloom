@@ -16,12 +16,23 @@ use termloom::services::lsp::{
     ClientStatus, LspClient, LspEvent, LspResult, LspSink, RequestContext, RequestKind,
 };
 
+/// Locate a *working* rust-analyzer.
+///
+/// A rustup shim called `rust-analyzer` exists on PATH even when the
+/// component is not installed — it is on GitHub's runners — and running it
+/// just prints an error. Probing the binary is what separates "installed"
+/// from "merely present", so the test skips instead of waiting for a server
+/// that will never speak the protocol.
 fn rust_analyzer() -> Option<String> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+    let candidate = std::env::split_paths(&paths)
         .map(|dir| dir.join("rust-analyzer"))
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().to_string())
+        .find(|path| path.is_file())?;
+    let usable = std::process::Command::new(&candidate)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    usable.then(|| candidate.to_string_lossy().to_string())
 }
 
 /// A tiny cargo project with a deliberate error.

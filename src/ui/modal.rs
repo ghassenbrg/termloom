@@ -14,10 +14,17 @@ pub fn draw(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     let (title, body, footer, accent) = match modal {
         Modal::Confirm { title, message, .. } => (
             title.clone(),
-            vec![Line::from(Span::styled(
-                message.clone(),
-                Style::default().fg(theme.text),
-            ))],
+            // Messages are written with line breaks (a command line on its
+            // own line, for instance); keep them.
+            message
+                .split('\n')
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(theme.text),
+                    ))
+                })
+                .collect(),
             " Enter / y confirm · Esc cancel ".to_string(),
             theme.danger,
         ),

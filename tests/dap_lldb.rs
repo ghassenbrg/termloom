@@ -183,6 +183,13 @@ fn debugs_a_real_program_end_to_end() {
     let names: Vec<&str> = variables.iter().map(|v| v.name.as_str()).collect();
     assert!(names.contains(&"a"), "{names:?}");
     assert!(names.contains(&"b"), "{names:?}");
+    // Scopes keep the adapter's order, so locals are not buried under the
+    // register list in the panel.
+    let locals = names.iter().position(|name| *name == "Locals");
+    let registers = names.iter().position(|name| *name == "Registers");
+    if let (Some(locals), Some(registers)) = (locals, registers) {
+        assert!(locals < registers, "locals should come first: {names:?}");
+    }
     let b = variables.iter().find(|v| v.name == "b").unwrap();
     assert_eq!(b.value, "40");
 

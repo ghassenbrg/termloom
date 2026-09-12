@@ -478,7 +478,7 @@ fn confirm_debug_start(state: &mut AppState, entry: dap::LaunchEntry) {
             state.confirm(
                 "Run debug adapter",
                 format!(
-                    "{} will run:\n\n{}\n\nin {}",
+                    "{} will run this debug adapter:\n\n{}\n\nworking directory: {}",
                     config.name,
                     config.command_line(),
                     config.cwd.display()

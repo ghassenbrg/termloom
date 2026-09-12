@@ -160,7 +160,8 @@ struct Driver {
     selected_frame: Option<i64>,
     variables: Vec<Variable>,
     /// Scope references still to fetch for the selected frame.
-    scope_queue: Vec<(String, i64)>,
+    /// Scopes still to fetch for the selected frame, in adapter order.
+    scope_queue: std::collections::VecDeque<(String, i64)>,
     breakpoints: HashMap<PathBuf, Vec<usize>>,
     launched: bool,
     /// Reason reported by the last `stopped` event.
@@ -189,7 +190,7 @@ impl Driver {
             current_thread: 1,
             selected_frame: None,
             variables: Vec::new(),
-            scope_queue: Vec::new(),
+            scope_queue: std::collections::VecDeque::new(),
             launched: false,
             session_id,
             ended: false,
@@ -442,7 +443,9 @@ impl Driver {
             }
             Pending::Scopes => {
                 self.variables.clear();
-                self.scope_queue = protocol::parse_scopes(&body);
+                // Adapters list the most useful scope first (Locals before
+                // Registers); keep that order in the panel.
+                self.scope_queue = protocol::parse_scopes(&body).into_iter().collect();
                 self.request_next_scope();
             }
             Pending::Variables(depth) => {
@@ -464,7 +467,7 @@ impl Driver {
 
     /// Fetch the next scope's variables, adding a header row for it.
     fn request_next_scope(&mut self) {
-        let Some((name, reference)) = self.scope_queue.pop() else {
+        let Some((name, reference)) = self.scope_queue.pop_front() else {
             self.emit(DebugEvent::Variables(self.variables.clone()));
             return;
         };

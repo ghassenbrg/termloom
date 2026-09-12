@@ -13,3 +13,15 @@ verbosity with `--log-level` or `TERMLOOM_LOG`.
 - If a VSIX is `Broken`, inspect its report for a missing/unsafe asset. Partial
   usually means it depends on VS Code APIs TermLoom will not execute.
 - Outside Git, Git panels are empty by design; editing and PTYs continue.
+
+## Breakpoints stay unverified
+
+The debug adapter matches breakpoints against the source path recorded in the
+program's debug information. TermLoom sends the resolved path of the open
+file, so a mismatch appears when the program was compiled through a symlinked
+path — building under `/tmp` on macOS (a symlink to `/private/tmp`) is the
+common case. Rebuild from the resolved path, or open the workspace through
+the same path the compiler saw, and the breakpoint binds.
+
+The Debug panel reports what the adapter accepted, so an unverified
+breakpoint stays visible as a plain marker rather than silently doing nothing.

@@ -2,7 +2,7 @@
 name = "termloom"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "Agent-native development environment for your terminal"
 license = "MIT"
 repository = "https://github.com/ghassenbrg/termloom"

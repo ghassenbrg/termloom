@@ -1,6 +1,6 @@
 # Contributing
 
-TermLoom uses stable Rust (minimum 1.85). Keep domain types independent from
+TermLoom uses stable Rust (minimum 1.90). Keep domain types independent from
 Ratatui, portable-pty, git2, transport, and Herdr implementation types. New
 user actions belong in the stable command registry and should be reachable by
 palette or keyboard.

@@ -1,6 +1,6 @@
 # Development
 
-Use stable Rust 1.85 or newer:
+Use stable Rust 1.90 or newer:
 
 ```bash
 cargo fmt --check

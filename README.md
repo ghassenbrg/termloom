@@ -11,7 +11,7 @@ without leaving one keyboard-first TUI.
 
 ## Install and run
 
-TermLoom V1 supports macOS and Linux and requires Rust 1.85 or newer to build:
+TermLoom V1 supports macOS and Linux and requires Rust 1.90 or newer to build:
 
 ```bash
 cargo install --path .

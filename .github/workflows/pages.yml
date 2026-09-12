@@ -1,0 +1,46 @@
+name: Site
+
+# Publishes the install script and landing page to GitHub Pages, which serves
+# them at the custom domain in site/CNAME.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          cp -r site/. public/
+          # One copy of the installer lives at the repository root; the site
+          # serves that exact file so the two cannot drift.
+          cp install.sh public/install.sh
+          sh -n public/install.sh
+          ls -la public
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TermLoom — agent-native development in your terminal</title>
+<meta name="description" content="TermLoom is a terminal-native, agent-first IDE: explorer, editor, Git, real PTYs, Claude and Codex sessions, LSP, DAP and safe VS Code extension assets.">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117; --surface: #10151c; --border: #262e3a;
+    --text: #c9d1d9; --bright: #ecf2f8; --dim: #6e7988; --accent: #2dd4bf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 4rem 1.25rem; background: var(--bg); color: var(--text);
+    font: 16px/1.65 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size: 2.25rem; margin: 0; color: var(--bright); letter-spacing: -0.02em; }
+  .tag { color: var(--accent); margin: 0.25rem 0 2rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em;
+       color: var(--dim); margin: 2.5rem 0 0.75rem; font-weight: 600; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+        padding: 0.9rem 1rem; overflow-x: auto; margin: 0 0 0.75rem; }
+  code { color: var(--bright); }
+  ul { padding-left: 1.1rem; }
+  li { margin: 0.35rem 0; }
+  a { color: var(--accent); }
+  footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border);
+           color: var(--dim); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TermLoom</h1>
+  <p class="tag">Weave your development workspace.</p>
+
+  <p>A terminal-native, agent-first workbench: project explorer, editor with
+  syntax highlighting, Git, real interactive terminals, Claude Code and Codex
+  as first-class sessions, LSP, DAP, and a safe VS&nbsp;Code extension
+  compatibility layer.</p>
+
+  <h2>Install</h2>
+  <pre><code>curl -fsSL https://termloom.ghassen.io/install.sh | sh</code></pre>
+  <p>macOS (Apple silicon and Intel) and Linux x86_64. The script downloads a
+  release binary, verifies its SHA-256 checksum and installs it into
+  <code>~/.local/bin</code>. Read it first if you like —
+  <a href="/install.sh">it is right here</a>.</p>
+
+  <h2>Or with cargo</h2>
+  <pre><code>cargo install --git https://github.com/ghassenbrg/termloom --locked</code></pre>
+
+  <h2>Use it</h2>
+  <pre><code>termloom doctor   # what this machine can integrate with
+termloom .        # open a repository</code></pre>
+  <ul>
+    <li><code>Ctrl+Space</code> then <code>C</code> — a Claude Code session in a pane</li>
+    <li><code>Ctrl+Space</code> then <code>T</code> — a real shell</li>
+    <li><code>Ctrl+P</code> — open a file, <code>Ctrl+Space P</code> — command palette</li>
+    <li><code>F1</code> — every shortcut</li>
+  </ul>
+
+  <footer>
+    <a href="https://github.com/ghassenbrg/termloom">Source</a> ·
+    <a href="https://github.com/ghassenbrg/termloom/releases">Releases</a> ·
+    <a href="https://github.com/ghassenbrg/termloom/blob/main/docs/getting-started.md">Docs</a> ·
+    MIT licensed
+  </footer>
+</main>
+</body>
+</html>

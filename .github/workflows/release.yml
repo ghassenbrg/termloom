@@ -1,14 +1,21 @@
-name: Release binaries
+name: Release
 
+# Tag a commit to publish: `git tag v0.1.0 && git push origin v0.1.0`.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -22,6 +29,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.90"
@@ -30,16 +39,88 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target "${{ matrix.target }}"
+
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           archive="termloom-${{ matrix.target }}"
           mkdir "$archive"
           cp "target/${{ matrix.target }}/release/termloom" "$archive/"
-          cp README.md LICENSE "$archive/"
+          cp README.md LICENSE CHANGELOG.md "$archive/"
           tar -czf "$archive.tar.gz" "$archive"
+
+      - name: Smoke test the binary
+        # Only the host-native builds can run here; an x86_64 binary will not
+        # execute on the arm64 runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "target/${{ matrix.target }}/release/termloom" --version
+          "target/${{ matrix.target }}/release/termloom" doctor || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: termloom-${{ matrix.target }}
           path: termloom-${{ matrix.target }}.tar.gz
           if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          # Take this version's section out of the changelog when it has one.
+          awk -v v="$version" '
+            $0 ~ "^## " v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://termloom.ghassen.io/install.sh | sh"
+            echo '```'
+            echo
+            echo "Or download a tarball below and verify it against \`SHA256SUMS\`."
+          } >> notes.md
+          cat notes.md
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+            --title "TermLoom ${tag#v}" \
+            --notes-file notes.md \
+            --verify-tag

@@ -11,10 +11,26 @@ without leaving one keyboard-first TUI.
 
 ## Install and run
 
-TermLoom V1 supports macOS and Linux and requires Rust 1.90 or newer to build:
+macOS (Apple silicon and Intel) and Linux x86_64:
 
 ```bash
-cargo install --path .
+curl -fsSL https://termloom.ghassen.io/install.sh | sh
+```
+
+The script downloads the release binary for your platform, verifies its
+SHA-256 checksum and installs it into `~/.local/bin`. Read it first at
+<https://termloom.ghassen.io/install.sh> if you would rather not pipe to a
+shell; `--version` and `--dir` override what it does.
+
+From source instead, with Rust 1.90 or newer:
+
+```bash
+cargo install --git https://github.com/ghassenbrg/termloom --locked
+```
+
+Then:
+
+```bash
 cd /path/to/project
 termloom .
 ```

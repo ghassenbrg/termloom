@@ -23,3 +23,5 @@ archive extraction, destructive Git/file operations, or adapter execution need
 negative/security tests as well as the happy path.
 
 See [docs/development.md](docs/development.md) for manual checks.
+
+Releases are cut by pushing a `v*` tag; see [RELEASING.md](RELEASING.md).

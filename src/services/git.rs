@@ -318,7 +318,7 @@ mod tests {
         let by_path = |name: &str| {
             snap.changes
                 .iter()
-                .find(|c| c.path == PathBuf::from(name))
+                .find(|c| c.path == Path::new(name))
                 .cloned()
                 .unwrap_or_else(|| panic!("{name} missing from {:?}", snap.changes))
         };
@@ -344,7 +344,7 @@ mod tests {
         let entry = staged
             .changes
             .iter()
-            .find(|c| c.path == PathBuf::from("tracked.txt"))
+            .find(|c| c.path == Path::new("tracked.txt"))
             .unwrap();
         assert_eq!(entry.index, Some(FileStatus::Modified));
         assert!(entry.is_staged());
@@ -354,7 +354,7 @@ mod tests {
         let entry = after
             .changes
             .iter()
-            .find(|c| c.path == PathBuf::from("tracked.txt"))
+            .find(|c| c.path == Path::new("tracked.txt"))
             .unwrap();
         assert_eq!(entry.index, None);
         assert_eq!(entry.worktree, Some(FileStatus::Modified));
@@ -368,7 +368,7 @@ mod tests {
         let entry = snap
             .changes
             .iter()
-            .find(|c| c.path == PathBuf::from("deleted.txt"))
+            .find(|c| c.path == Path::new("deleted.txt"))
             .unwrap();
         assert_eq!(entry.index, Some(FileStatus::Deleted));
     }

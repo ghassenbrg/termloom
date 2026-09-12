@@ -118,6 +118,12 @@ pub trait AgentBackend: Send + Sync {
     /// Change the display label.
     async fn rename(&self, id: AgentId, label: &str) -> Result<()>;
 
+    /// Ask an external backend to focus its terminal. Local sessions are
+    /// focused directly by the workbench through their `terminal_id`.
+    async fn focus(&self, _id: AgentId) -> Result<()> {
+        anyhow::bail!("this backend cannot focus an external terminal")
+    }
+
     /// Forget a finished session.
     async fn remove(&self, id: AgentId) -> Result<()>;
 
@@ -139,6 +145,7 @@ pub trait AgentBackend: Send + Sync {
 }
 
 /// Aggregates the active backends and routes calls to the owning one.
+#[derive(Clone)]
 pub struct AgentRegistry {
     backends: Vec<std::sync::Arc<dyn AgentBackend>>,
 }

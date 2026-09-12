@@ -79,10 +79,7 @@ impl Decoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Value>> {
         self.buffer.extend_from_slice(bytes);
         let mut out = Vec::new();
-        loop {
-            let Some(header_end) = find_header_end(&self.buffer) else {
-                break;
-            };
+        while let Some(header_end) = find_header_end(&self.buffer) {
             let header = String::from_utf8_lossy(&self.buffer[..header_end]).to_string();
             let Some(length) = parse_content_length(&header)? else {
                 bail!("message header is missing Content-Length");

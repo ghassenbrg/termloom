@@ -386,7 +386,7 @@ impl FileIndex {
         let ignore_names = options.ignore_names.clone();
         builder.filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            !ignore_names.iter().any(|i| *i == name)
+            !ignore_names.contains(&name)
         });
 
         let mut files = Vec::new();

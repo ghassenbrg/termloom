@@ -1,0 +1,12 @@
+id = "termloom.workbench"
+name = "TermLoom Workbench"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Open the standalone TermLoom IDE in a Herdr-managed terminal pane"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "workbench"
+title = "Open TermLoom"
+placement = "zoomed"
+command = ["scripts/open-termloom"]

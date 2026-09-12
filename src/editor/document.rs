@@ -98,7 +98,7 @@ impl Document {
         Ok(Document {
             id: EditorTabId::next(),
             path: Some(path.to_path_buf()),
-            buffer: TextBuffer::from_str(&text),
+            buffer: TextBuffer::from_text(&text),
             language,
             scroll: 0,
             h_scroll: 0,
@@ -121,7 +121,7 @@ impl Document {
         Document {
             id: EditorTabId::next(),
             path: None,
-            buffer: TextBuffer::from_str(""),
+            buffer: TextBuffer::from_text(""),
             language,
             scroll: 0,
             h_scroll: 0,
@@ -193,7 +193,7 @@ impl Document {
                 .collect::<Vec<_>>()
                 .join("\n");
             let cursor = self.buffer.cursor();
-            let mut next = TextBuffer::from_str(&trimmed);
+            let mut next = TextBuffer::from_text(&trimmed);
             next.crlf = self.buffer.crlf;
             next.trailing_newline = self.buffer.trailing_newline;
             // Preserve dirtiness and cursor; the fixup is part of this save.
@@ -213,7 +213,7 @@ impl Document {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reloading {}", path.display()))?;
         let cursor = self.buffer.cursor();
-        self.buffer = TextBuffer::from_str(&text);
+        self.buffer = TextBuffer::from_text(&text);
         self.buffer.move_to(cursor, false);
         self.disk = DiskState::read(&path);
         self.external_change = ExternalChange::None;

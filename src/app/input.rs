@@ -772,6 +772,7 @@ fn handle_agent_detail_key(state: &mut AppState, services: &mut Services, key: K
                 } else if let Some(task) = agent.tasks.last_mut() {
                     task.done = false;
                 }
+                state.agent_tasks.insert(agent.id, agent.tasks.clone());
             }
             true
         }
@@ -897,6 +898,10 @@ fn handle_debug_key(state: &mut AppState, services: &mut Services, key: KeyEvent
             select_debug_frame(state, services);
             true
         }
+        KeyCode::Char('e') => {
+            actions::execute(state, services, "debug.evaluate");
+            true
+        }
         KeyCode::Esc => {
             state.layout.debug = false;
             state.focus = match state.active_tab {
@@ -947,6 +952,21 @@ fn handle_extensions_key(state: &mut AppState, key: KeyEvent) -> bool {
         }
         KeyCode::Char('i') => {
             state.prompt("Install VSIX", "", PromptPurpose::InstallVsix);
+            true
+        }
+        KeyCode::Char('x') => {
+            if let Some(id) = state
+                .extensions
+                .installed
+                .get(state.extensions.selected)
+                .map(|report| report.id.clone())
+            {
+                state.confirm(
+                    "Remove extension",
+                    format!("Remove {id} and its installed declarative assets?"),
+                    crate::app::state::ConfirmAction::RemoveExtension(id),
+                );
+            }
             true
         }
         _ => false,

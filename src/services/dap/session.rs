@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use crate::domain::debug::{DebugCapabilities, DebugThread, StackFrame, Variable}
 use super::client::{AdapterMessage, DapClient};
 use super::config::DebugLaunchConfig;
 use super::protocol;
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// What the UI asks the session to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,9 +65,15 @@ pub enum DebugEvent {
     /// The program finished.
     Exited { code: i64 },
     /// The session ended.
-    Terminated,
-    /// Something went wrong; the message is user-facing.
-    Failed { message: String },
+    Terminated { session_id: u64 },
+    /// Something went wrong; the message is user-facing. A rejected optional
+    /// request (for example `evaluate`) is recoverable and must not make the
+    /// whole session appear dead.
+    Failed {
+        session_id: u64,
+        message: String,
+        fatal: bool,
+    },
 }
 
 /// Callback used to publish [`DebugEvent`]s.
@@ -73,6 +82,7 @@ pub type DebugSink = Arc<dyn Fn(DebugEvent) + Send + Sync>;
 /// Handle to a running session.
 pub struct DebugSession {
     commands: Sender<DebugCommand>,
+    session_id: u64,
     /// The adapter command line, for display and consent.
     pub command_line: String,
     pub configuration: String,
@@ -83,6 +93,7 @@ impl DebugSession {
     pub fn start(config: DebugLaunchConfig, sink: DebugSink) -> Result<DebugSession> {
         let (message_tx, message_rx) = mpsc::channel();
         let (command_tx, command_rx) = mpsc::channel();
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
 
         let client = DapClient::start(
             &config.adapter_command,
@@ -97,13 +108,14 @@ impl DebugSession {
         std::thread::Builder::new()
             .name("termloom-debug".into())
             .spawn(move || {
-                let mut driver = Driver::new(client, config, sink);
+                let mut driver = Driver::new(client, config, sink, session_id);
                 driver.run(message_rx, command_rx);
             })
             .expect("spawning the debug driver thread");
 
         Ok(DebugSession {
             commands: command_tx,
+            session_id,
             command_line,
             configuration,
         })
@@ -114,6 +126,10 @@ impl DebugSession {
         self.commands
             .send(command)
             .map_err(|_| anyhow::anyhow!("the debug session has ended"))
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
 }
 
@@ -149,10 +165,17 @@ struct Driver {
     launched: bool,
     /// Reason reported by the last `stopped` event.
     last_stop_reason: String,
+    session_id: u64,
+    ended: bool,
 }
 
 impl Driver {
-    fn new(client: DapClient, config: DebugLaunchConfig, sink: DebugSink) -> Driver {
+    fn new(
+        client: DapClient,
+        config: DebugLaunchConfig,
+        sink: DebugSink,
+        session_id: u64,
+    ) -> Driver {
         Driver {
             client,
             breakpoints: config.breakpoints.clone(),
@@ -168,6 +191,8 @@ impl Driver {
             variables: Vec::new(),
             scope_queue: Vec::new(),
             launched: false,
+            session_id,
+            ended: false,
         }
     }
 
@@ -178,7 +203,12 @@ impl Driver {
             Pending::Initialize,
         ) {
             self.emit(DebugEvent::Failed {
+                session_id: self.session_id,
                 message: format!("{err:#}"),
+                fatal: true,
+            });
+            self.emit(DebugEvent::Terminated {
+                session_id: self.session_id,
             });
             return;
         }
@@ -188,14 +218,21 @@ impl Driver {
             match messages.try_recv() {
                 Ok(AdapterMessage::Message(message)) => {
                     self.on_message(message);
+                    if self.ended {
+                        return;
+                    }
                     continue;
                 }
                 Ok(AdapterMessage::Disconnected) => {
-                    self.emit(DebugEvent::Terminated);
+                    self.emit(DebugEvent::Terminated {
+                        session_id: self.session_id,
+                    });
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.emit(DebugEvent::Terminated);
+                    self.emit(DebugEvent::Terminated {
+                        session_id: self.session_id,
+                    });
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -210,7 +247,9 @@ impl Driver {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.client.terminate();
-                    self.emit(DebugEvent::Terminated);
+                    self.emit(DebugEvent::Terminated {
+                        session_id: self.session_id,
+                    });
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -262,7 +301,9 @@ impl Driver {
             ),
             DebugCommand::Stop => {
                 self.client.terminate();
-                self.emit(DebugEvent::Terminated);
+                self.emit(DebugEvent::Terminated {
+                    session_id: self.session_id,
+                });
                 return true;
             }
             DebugCommand::SetBreakpoints(path, lines) => {
@@ -286,8 +327,15 @@ impl Driver {
         };
         if let Err(err) = result {
             self.emit(DebugEvent::Failed {
+                session_id: self.session_id,
                 message: format!("{err:#}"),
+                fatal: true,
             });
+            self.client.terminate();
+            self.emit(DebugEvent::Terminated {
+                session_id: self.session_id,
+            });
+            return true;
         }
         false
     }
@@ -320,10 +368,16 @@ impl Driver {
             // A failed step or evaluate is not fatal; a failed launch is.
             let fatal = matches!(pending, Pending::Initialize | Pending::Launch);
             self.emit(DebugEvent::Failed {
+                session_id: self.session_id,
                 message: format!("{command} failed: {reason}"),
+                fatal,
             });
             if fatal {
                 self.client.terminate();
+                self.emit(DebugEvent::Terminated {
+                    session_id: self.session_id,
+                });
+                self.ended = true;
             }
             return;
         }
@@ -343,8 +397,15 @@ impl Driver {
                 let arguments = self.config.request_arguments();
                 if let Err(err) = self.send(request, arguments, Pending::Launch) {
                     self.emit(DebugEvent::Failed {
+                        session_id: self.session_id,
                         message: format!("{err:#}"),
+                        fatal: true,
                     });
+                    self.client.terminate();
+                    self.emit(DebugEvent::Terminated {
+                        session_id: self.session_id,
+                    });
+                    self.ended = true;
                 }
             }
             Pending::Launch => {
@@ -463,7 +524,9 @@ impl Driver {
                 code: body["exitCode"].as_i64().unwrap_or(0),
             }),
             "terminated" => {
-                self.emit(DebugEvent::Terminated);
+                self.emit(DebugEvent::Terminated {
+                    session_id: self.session_id,
+                });
             }
             "breakpoint" => {
                 // A breakpoint was (un)verified after the fact.

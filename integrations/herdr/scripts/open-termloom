@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+termloom_binary="${TERMLOOM_BIN:-termloom}"
+workspace="${TERMLOOM_WORKSPACE:-${PWD}}"
+
+exec "$termloom_binary" "$workspace"

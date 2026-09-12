@@ -244,7 +244,7 @@ pub const COMMANDS: &[Command] = &[
         "lsp.completion",
         "Trigger Completion",
         Language,
-        LanguageServer
+        ActiveEditor
     ),
     command!(
         "lsp.definition",
@@ -269,6 +269,12 @@ pub const COMMANDS: &[Command] = &[
     command!("debug.step_over", "Step Over", Debug, DebugSession),
     command!("debug.step_in", "Step Into", Debug, DebugSession),
     command!("debug.step_out", "Step Out", Debug, DebugSession),
+    command!(
+        "debug.evaluate",
+        "Evaluate Expression…",
+        Debug,
+        DebugSession
+    ),
     command!(
         "debug.toggle_breakpoint",
         "Toggle Breakpoint",

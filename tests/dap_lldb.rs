@@ -166,7 +166,7 @@ fn debugs_a_real_program_end_to_end() {
             _ => None,
         })
         .expect("the program should stop at the breakpoint");
-    assert_eq!(frames[0].name.contains("add"), true, "{:?}", frames[0]);
+    assert!(frames[0].name.contains("add"), "{:?}", frames[0]);
     assert_eq!(frames[0].line, 4, "DAP reports 1-based lines");
     assert!(
         frames.iter().any(|frame| frame.name.contains("main")),
@@ -202,7 +202,7 @@ fn debugs_a_real_program_end_to_end() {
     session.send(DebugCommand::Continue).unwrap();
     let output = events.wait(|event| match event {
         DebugEvent::Output { text, .. } if text.contains("total=42") => Some(text.clone()),
-        DebugEvent::Terminated => Some("terminated".into()),
+        DebugEvent::Terminated { .. } => Some("terminated".into()),
         DebugEvent::Exited { .. } => Some("exited".into()),
         _ => None,
     });

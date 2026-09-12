@@ -29,6 +29,8 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub herdr: HerdrConfig,
     pub workspace: WorkspaceConfig,
+    /// Per-workspace activation policy for installed declarative extensions.
+    pub extensions: ExtensionConfig,
     /// Agent launch presets, keyed by preset name (`claude`, `codex`, ...).
     pub agents: BTreeMap<String, AgentPreset>,
     /// Language server definitions, keyed by a server name (`rust-analyzer`).
@@ -187,6 +189,16 @@ pub struct HerdrConfig {
     pub command: Option<String>,
 }
 
+/// Installed packages are global, but a workspace may opt out of individual
+/// packages without deleting them from the machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtensionConfig {
+    /// Canonical manifest ids (`publisher.name`) that must not contribute
+    /// languages, snippets, or themes in this workspace.
+    pub disabled: Vec<String>,
+}
+
 impl Default for HerdrConfig {
     fn default() -> Self {
         Self {
@@ -197,7 +209,7 @@ impl Default for HerdrConfig {
 }
 
 /// A launchable agent preset.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentPreset {
     /// Display name in the palette / dashboard.
@@ -207,17 +219,6 @@ pub struct AgentPreset {
     pub args: Vec<String>,
     /// Extra environment variables for the child process.
     pub env: BTreeMap<String, String>,
-}
-
-impl Default for AgentPreset {
-    fn default() -> Self {
-        Self {
-            label: None,
-            command: String::new(),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        }
-    }
 }
 
 /// A language server definition.
@@ -256,7 +257,7 @@ impl Default for LspServerConfig {
 }
 
 /// A debug adapter definition.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DapAdapterConfig {
     /// Executable launched over stdio.
@@ -265,17 +266,6 @@ pub struct DapAdapterConfig {
     /// `launch.json` `type` values this adapter serves.
     pub types: Vec<String>,
     pub env: BTreeMap<String, String>,
-}
-
-impl Default for DapAdapterConfig {
-    fn default() -> Self {
-        Self {
-            command: String::new(),
-            args: Vec::new(),
-            types: Vec::new(),
-            env: BTreeMap::new(),
-        }
-    }
 }
 
 impl Config {
@@ -317,9 +307,8 @@ impl Config {
         let mut config = Config::with_builtin_defaults();
 
         if let Some(path) = global_config_path() {
-            match Self::load_file(&path) {
-                Ok(Some(other)) => config.merge(other),
-                Ok(None) => {}
+            match config.merge_file(&path) {
+                Ok(_) => {}
                 Err(err) => diagnostics.push(ConfigDiagnostic {
                     path: path.clone(),
                     message: format!("{err:#}"),
@@ -329,9 +318,8 @@ impl Config {
 
         if let Some(root) = workspace_root {
             let path = root.join(PROJECT_CONFIG_FILE);
-            match Self::load_file(&path) {
-                Ok(Some(other)) => config.merge(other),
-                Ok(None) => {}
+            match config.merge_file(&path) {
+                Ok(_) => {}
                 Err(err) => diagnostics.push(ConfigDiagnostic {
                     path,
                     message: format!("{err:#}"),
@@ -340,6 +328,29 @@ impl Config {
         }
 
         (config, diagnostics)
+    }
+
+    /// Overlay only the keys physically present in a TOML file. Deserialising
+    /// each layer directly into `Config` fills missing fields with defaults;
+    /// merging those structs would then accidentally reset unrelated values
+    /// from an earlier layer.
+    fn merge_file(&mut self, path: &Path) -> Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        // Validate unknown keys against the typed schema before overlaying.
+        let _: Config =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let incoming: toml::Value =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let mut base = toml::Value::try_from(self.clone())?;
+        merge_toml(&mut base, incoming);
+        *self = base
+            .try_into()
+            .with_context(|| format!("applying {}", path.display()))?;
+        Ok(true)
     }
 
     /// Parse a single config file. `Ok(None)` when the file does not exist.
@@ -373,6 +384,9 @@ impl Config {
         if other.workspace != defaults.workspace {
             self.workspace = other.workspace;
         }
+        if other.extensions != defaults.extensions {
+            self.extensions = other.extensions;
+        }
         self.agents.extend(other.agents);
         self.lsp.extend(other.lsp);
         self.dap.extend(other.dap);
@@ -398,6 +412,22 @@ impl Config {
     /// Serialise to TOML (used by `termloom config --write-default`).
     pub fn to_toml(&self) -> Result<String> {
         Ok(toml::to_string_pretty(self)?)
+    }
+}
+
+fn merge_toml(base: &mut toml::Value, incoming: toml::Value) {
+    match (base, incoming) {
+        (toml::Value::Table(base), toml::Value::Table(incoming)) => {
+            for (key, value) in incoming {
+                match base.get_mut(&key) {
+                    Some(current) => merge_toml(current, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, incoming) => *base = incoming,
     }
 }
 
@@ -536,6 +566,25 @@ mode = "disabled"
         cfg.merge(project);
         assert_eq!(cfg.agents["tests"].args, vec!["test".to_string()]);
         assert_eq!(cfg.agents.len(), 3);
+    }
+
+    #[test]
+    fn sparse_file_overlay_preserves_other_fields_and_can_restore_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[ui]\ntheme = \"termloom-dark\"\n[editor]\ninsert_spaces = false\n",
+        )
+        .unwrap();
+        let mut config = Config::with_builtin_defaults();
+        config.ui.theme = "custom-global".into();
+        config.editor.tab_width = 2;
+
+        assert!(config.merge_file(&path).unwrap());
+        assert_eq!(config.ui.theme, "termloom-dark");
+        assert_eq!(config.editor.tab_width, 2);
+        assert!(!config.editor.insert_spaces);
     }
 
     #[test]

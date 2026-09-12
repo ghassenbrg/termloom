@@ -4,7 +4,7 @@
 //! background threads and performs no rendering: services push events into the
 //! loop, the loop mutates this state, the UI reads it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 
 use crate::config::{Config, ConfigDiagnostic, Keymap};
-use crate::domain::agent::{AgentSession, AgentState};
+use crate::domain::agent::{AgentSession, AgentState, AgentTask};
 use crate::domain::debug::{DebugCapabilities, DebugStatus, DebugThread, StackFrame, Variable};
 use crate::domain::diagnostics::Location;
 use crate::domain::diagnostics::{Diagnostic, Position, Severity};
@@ -179,6 +179,7 @@ pub enum PromptPurpose {
     CustomAgentCommand,
     InstallVsix,
     InspectVsix,
+    DebugEvaluate,
     RenameSymbol(Position),
 }
 
@@ -369,6 +370,9 @@ pub struct AppState {
 
     // ── agents ────────────────────────────────────────────────────────────
     pub agents: Vec<AgentSession>,
+    /// User-authored checklists outlive backend refreshes. Backends report
+    /// process state; they do not own this local UI data.
+    pub agent_tasks: HashMap<AgentId, Vec<AgentTask>>,
     pub agent_selection: ListSelection,
     pub agent_tab: AgentDetailTab,
     /// Cached output lines for the selected agent's detail panel.
@@ -424,6 +428,8 @@ pub struct AppState {
     pub highlighter: Highlighter,
     pub outliner: OutlineExtractor,
     pub languages: LanguageRegistry,
+    /// Declarative VS Code snippets keyed by language id.
+    pub snippets: HashMap<String, Vec<CompletionItem>>,
     pub commands: CommandRegistry,
     pub matcher: nucleo_matcher::Matcher,
 }
@@ -457,6 +463,7 @@ impl AppState {
             focused_terminal: None,
             terminal_view_offset: 0,
             agents: Vec::new(),
+            agent_tasks: HashMap::new(),
             agent_selection: ListSelection::default(),
             agent_tab: AgentDetailTab::Status,
             agent_output: Vec::new(),
@@ -490,6 +497,7 @@ impl AppState {
             highlighter: Highlighter::new(),
             outliner: OutlineExtractor::new(),
             languages: LanguageRegistry::new(),
+            snippets: HashMap::new(),
             commands: CommandRegistry::new(),
             matcher: nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT),
             config,

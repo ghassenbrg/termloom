@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -19,6 +19,8 @@ use crate::domain::diagnostics::{Diagnostic, Location, Position, Symbol};
 
 use super::protocol::{self, CompletionItem, ServerCapabilities, TextEdit};
 use crate::services::framing;
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Which request a response belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +89,9 @@ pub enum LspEvent {
     Status { server: String, message: String },
     Exited {
         server: String,
+        /// Distinguishes an old process from a replacement with the same
+        /// configured name.
+        instance_id: u64,
         status: Option<i32>,
         /// True when the process died without us asking it to.
         crashed: bool,
@@ -141,6 +146,7 @@ pub struct LspClient {
     shutting_down: Arc<AtomicBool>,
     open_documents: HashMap<PathBuf, i64>,
     config: LspServerConfig,
+    instance_id: u64,
 }
 
 impl LspClient {
@@ -175,6 +181,7 @@ impl LspClient {
         let capabilities = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(ClientStatus::Starting));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
 
         spawn_reader(
             name.to_string(),
@@ -184,6 +191,7 @@ impl LspClient {
             Arc::clone(&capabilities),
             Arc::clone(&status),
             Arc::clone(&shutting_down),
+            instance_id,
             sink.clone(),
         );
         spawn_stderr_logger(name.to_string(), stderr);
@@ -200,6 +208,7 @@ impl LspClient {
             shutting_down,
             open_documents: HashMap::new(),
             config: config.clone(),
+            instance_id,
         };
 
         let options = config
@@ -222,6 +231,10 @@ impl LspClient {
 
     pub fn config(&self) -> &LspServerConfig {
         &self.config
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Languages this server was configured for.
@@ -356,6 +369,7 @@ fn spawn_reader(
     capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     status: Arc<Mutex<ClientStatus>>,
     shutting_down: Arc<AtomicBool>,
+    instance_id: u64,
     sink: LspSink,
 ) {
     std::thread::Builder::new()
@@ -390,6 +404,7 @@ fn spawn_reader(
             }
             sink(LspEvent::Exited {
                 server: name,
+                instance_id,
                 status: None,
                 crashed,
             });

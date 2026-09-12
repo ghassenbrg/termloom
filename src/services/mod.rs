@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod dap;
+pub mod extensions;
 pub mod framing;
 pub mod fs_ops;
 pub mod git;

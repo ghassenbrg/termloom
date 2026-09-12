@@ -26,8 +26,8 @@ use super::state::{
 pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
     match id {
         // ── file ──────────────────────────────────────────────────────────
-        "file.save" => save_active(state, false),
-        "file.save_all" => save_all(state),
+        "file.save" => save_active(state, services, false),
+        "file.save_all" => save_all(state, services),
         "file.reload" => reload_active(state),
         "file.new" => {
             let dir = state.explorer_target_dir();
@@ -63,7 +63,7 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         }
 
         // ── editor ────────────────────────────────────────────────────────
-        "editor.close_tab" => close_active_tab(state),
+        "editor.close_tab" => close_active_tab(state, services),
         "editor.close_others" => {
             let keep = state.active_tab;
             let ids: Vec<_> = state
@@ -73,7 +73,7 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
                 .map(|d| d.id)
                 .collect();
             for id in ids {
-                state.close_tab(id, false);
+                close_tab(state, services, id, false);
             }
         }
         "editor.next_tab" => state.next_tab(1),
@@ -146,7 +146,25 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         }
         "view.toggle.extensions" | "extensions.list" => {
             state.layout.extensions = !state.layout.extensions;
+            if state.layout.extensions {
+                reload_extensions(state);
+            }
         }
+        "extensions.install" => state.prompt("Install VSIX", "", PromptPurpose::InstallVsix),
+        "extensions.inspect" => state.prompt("Inspect VSIX", "", PromptPurpose::InspectVsix),
+        "extensions.remove" => match state
+            .extensions
+            .installed
+            .get(state.extensions.selected)
+            .map(|report| report.id.clone())
+        {
+            Some(id) => state.confirm(
+                "Remove extension",
+                format!("Remove {id} and its installed declarative assets?"),
+                ConfirmAction::RemoveExtension(id),
+            ),
+            None => state.warn("no extension selected"),
+        },
         "view.focus.explorer" => {
             state.layout.explorer = true;
             state.focus = FocusTarget::Explorer;
@@ -211,10 +229,24 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
             PromptPurpose::CustomAgentCommand,
         ),
         "agent.focus_terminal" => {
-            if let Some(id) = state.selected_agent().and_then(|a| a.terminal_id) {
-                state.focus_terminal(id);
-            } else {
-                state.warn("this agent has no terminal");
+            match state
+                .selected_agent()
+                .map(|agent| (agent.id, agent.terminal_id))
+            {
+                Some((_, Some(terminal))) => state.focus_terminal(terminal),
+                Some((id, None)) => {
+                    let result = services.runtime.block_on(async {
+                        match services.agents.owner(id).await {
+                            Some(backend) => backend.focus(id).await,
+                            None => Err(anyhow::anyhow!("no backend owns this agent")),
+                        }
+                    });
+                    match result {
+                        Ok(()) => state.info("focused the agent in Herdr"),
+                        Err(err) => state.warn(format!("could not focus agent: {err:#}")),
+                    }
+                }
+                None => state.warn("no agent selected"),
             }
         }
         "agent.send_input" => match state.selected_agent_id() {
@@ -264,6 +296,7 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
                         None => Ok(()),
                     }
                 });
+                state.agent_tasks.remove(&id);
                 refresh_agents(state, services);
                 state.agent_selection.clamp(state.agents.len());
                 state.reconcile_terminal_focus();
@@ -323,6 +356,7 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         "debug.step_over" => debug_command(state, services, DebugCommand::StepOver),
         "debug.step_in" => debug_command(state, services, DebugCommand::StepIn),
         "debug.step_out" => debug_command(state, services, DebugCommand::StepOut),
+        "debug.evaluate" => state.prompt("Evaluate expression", "", PromptPurpose::DebugEvaluate),
         "debug.toggle_breakpoint" => toggle_breakpoint(state, services),
         "debug.clear_breakpoints" => {
             let paths: Vec<PathBuf> = state
@@ -347,7 +381,14 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         "lsp.stop" => stop_language_server(state, services),
         "lsp.hover" => lsp_request(state, services, RequestKind::Hover, RequestExtra::None),
         "lsp.completion" => {
-            lsp_request(state, services, RequestKind::Completion, RequestExtra::None)
+            let local = show_snippet_completions(state);
+            if let Err(err) =
+                send_lsp_request(state, services, RequestKind::Completion, RequestExtra::None)
+            {
+                if !local {
+                    state.warn(format!("{err:#}"));
+                }
+            }
         }
         "lsp.definition" => {
             lsp_request(state, services, RequestKind::Definition, RequestExtra::None)
@@ -667,6 +708,52 @@ fn lsp_request(
     }
 }
 
+/// The completion command also works without an LSP when an installed VSIX
+/// contributes snippets. If an LSP is live its response replaces/extends this
+/// popup shortly afterwards.
+fn show_snippet_completions(state: &mut AppState) -> bool {
+    let Some(document) = state.active_document() else {
+        return false;
+    };
+    let position = document.buffer.cursor();
+    let prefix = document.buffer.word_at(position).unwrap_or_default();
+    let Some(items) = state.snippets.get(document.language.as_str()).cloned() else {
+        return false;
+    };
+    if items.is_empty() {
+        return false;
+    }
+    state.completion = Some(crate::app::state::CompletionPopup {
+        items,
+        selected: 0,
+        position,
+        prefix,
+    });
+    true
+}
+
+fn send_lsp_request(
+    state: &AppState,
+    services: &mut Services,
+    kind: RequestKind,
+    extra: RequestExtra,
+) -> anyhow::Result<()> {
+    let document = state
+        .active_document()
+        .ok_or_else(|| anyhow::anyhow!("open a file first"))?;
+    let path = document
+        .path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("save this buffer to a file first"))?;
+    services.lsp.request(
+        &document.language,
+        kind,
+        path,
+        document.buffer.cursor(),
+        extra,
+    )
+}
+
 /// Commands whose service is not running report exactly why.
 fn unavailable(state: &mut AppState, id: &str) {
     let message = match id {
@@ -684,7 +771,7 @@ fn unavailable(state: &mut AppState, id: &str) {
 
 // ── file helpers ──────────────────────────────────────────────────────────
 
-fn save_active(state: &mut AppState, force: bool) {
+fn save_active(state: &mut AppState, services: &mut Services, force: bool) {
     let Some(id) = state.active_tab else {
         return;
     };
@@ -703,8 +790,14 @@ fn save_active(state: &mut AppState, force: bool) {
             return;
         }
     }
-    match document.save(&config) {
-        Ok(path) => {
+    let result = document.save(&config).map(|path| {
+        let language = document.language.clone();
+        let text = document.buffer.to_text();
+        (path, language, text)
+    });
+    match result {
+        Ok((path, language, text)) => {
+            services.lsp.did_save(&path, &language, &text);
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -715,18 +808,45 @@ fn save_active(state: &mut AppState, force: bool) {
     }
 }
 
-fn save_all(state: &mut AppState) {
+fn save_all(state: &mut AppState, services: &mut Services) {
     let config = state.config.editor.clone();
     let mut saved = 0;
     let mut errors = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut notifications = Vec::new();
     for document in state.documents.iter_mut().filter(|d| d.is_dirty()) {
+        document.check_external_change();
+        if document.save_would_conflict() {
+            conflicts.push(
+                document
+                    .path
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|path| path.to_string())
+                    .unwrap_or_else(|| document.display_name()),
+            );
+            continue;
+        }
         match document.save(&config) {
-            Ok(_) => saved += 1,
+            Ok(path) => {
+                notifications.push((path, document.language.clone(), document.buffer.to_text()));
+                saved += 1;
+            }
             Err(err) => errors.push(format!("{err:#}")),
         }
     }
+    for (path, language, text) in notifications {
+        services.lsp.did_save(&path, &language, &text);
+    }
     for error in errors {
         state.error(error);
+    }
+    if !conflicts.is_empty() {
+        state.warn(format!(
+            "skipped {} externally changed file(s): {}; save them individually to review the overwrite",
+            conflicts.len(),
+            conflicts.join(", ")
+        ));
     }
     if saved > 0 {
         state.info(format!("saved {saved} file(s)"));
@@ -751,15 +871,33 @@ fn reload_active(state: &mut AppState) {
     }
 }
 
-fn close_active_tab(state: &mut AppState) {
+fn close_active_tab(state: &mut AppState, services: &mut Services) {
     let Some(id) = state.active_tab else { return };
-    if !state.close_tab(id, false) {
+    if !close_tab(state, services, id, false) {
         state.confirm(
             "Unsaved changes",
             "This file has unsaved changes. Close it anyway?",
             ConfirmAction::CloseDirtyTab(id),
         );
     }
+}
+
+fn close_tab(
+    state: &mut AppState,
+    services: &mut Services,
+    id: crate::domain::ids::EditorTabId,
+    force: bool,
+) -> bool {
+    let lifecycle = state
+        .document(id)
+        .and_then(|document| Some((document.path.clone()?, document.language.clone())));
+    if !state.close_tab(id, force) {
+        return false;
+    }
+    if let Some((path, language)) = lifecycle {
+        services.lsp.did_close(&path, &language);
+    }
+    true
 }
 
 fn find_step(state: &mut AppState, forward: bool) {
@@ -938,10 +1076,15 @@ fn restart_terminal(state: &mut AppState) {
 /// Refresh the agent list from every backend.
 pub fn refresh_agents(state: &mut AppState, services: &mut Services) {
     let registry = &services.agents;
-    let agents = services.runtime.block_on(async {
+    let mut agents = services.runtime.block_on(async {
         registry.refresh_all().await;
         registry.list_all().await
     });
+    for agent in &mut agents {
+        if let Some(tasks) = state.agent_tasks.get(&agent.id) {
+            agent.tasks.clone_from(tasks);
+        }
+    }
     state.agents = agents;
     state.agent_selection.clamp(state.agents.len());
 }
@@ -1073,9 +1216,22 @@ fn open_diff(state: &mut AppState) {
 // ── workspace ─────────────────────────────────────────────────────────────
 
 fn reload_workspace(state: &mut AppState, services: &mut Services) {
-    let (config, diagnostics) = crate::config::Config::load(Some(&state.workspace.root));
+    let (mut config, mut diagnostics) = crate::config::Config::load(Some(&state.workspace.root));
+    let vscode_settings = crate::services::vscode::read_settings(&state.workspace.root);
+    crate::services::vscode::apply_settings(&mut config, &vscode_settings);
+    if !vscode_settings.ignored.is_empty() {
+        diagnostics.push(crate::config::ConfigDiagnostic {
+            path: state.workspace.root.join(".vscode/settings.json"),
+            message: format!(
+                "ignored unsupported VS Code settings: {}",
+                vscode_settings.ignored.join(", ")
+            ),
+        });
+    }
     state.keymap = config.keymap();
     state.config = config;
+    services.lsp.set_config(&state.config);
+    reload_extensions(state);
     state.config_diagnostics = diagnostics;
     state.refresh_tree();
     services.refresh_git(state.git_root());
@@ -1138,7 +1294,7 @@ pub fn apply_confirm(state: &mut AppState, services: &mut Services, action: Conf
                 Ok(()) => {
                     // Close any tab showing the deleted file.
                     if let Some(id) = state.document_for_path(&path).map(|d| d.id) {
-                        state.close_tab(id, true);
+                        close_tab(state, services, id, true);
                     }
                     state.refresh_tree();
                     services.refresh_git(state.git_root());
@@ -1166,11 +1322,11 @@ pub fn apply_confirm(state: &mut AppState, services: &mut Services, action: Conf
             }
         }
         ConfirmAction::CloseDirtyTab(id) => {
-            state.close_tab(id, true);
+            close_tab(state, services, id, true);
         }
         ConfirmAction::OverwriteExternalChange(id) => {
             state.active_tab = Some(id);
-            save_active(state, true);
+            save_active(state, services, true);
         }
         ConfirmAction::ReloadExternalChange(id) => {
             if let Some(document) = state.document_mut(id) {
@@ -1192,11 +1348,14 @@ pub fn apply_confirm(state: &mut AppState, services: &mut Services, action: Conf
             }
             refresh_agents(state, services);
         }
-        ConfirmAction::RemoveExtension(id) => {
-            state.warn(format!(
-                "use `termloom extension remove {id}` to remove this package"
-            ));
-        }
+        ConfirmAction::RemoveExtension(id) => match crate::services::extensions::remove(&id) {
+            Ok(true) => {
+                reload_extensions(state);
+                state.info(format!("removed {id}"));
+            }
+            Ok(false) => state.warn(format!("extension {id} is not installed")),
+            Err(err) => state.error(format!("could not remove {id}: {err:#}")),
+        },
         ConfirmAction::StartDebugSession(config) => {
             launch_debug_session(state, services, *config);
         }
@@ -1351,11 +1510,13 @@ pub fn apply_prompt(
             if value.is_empty() {
                 return;
             }
+            let tasks = state.agent_tasks.entry(id).or_default();
+            tasks.push(crate::domain::agent::AgentTask {
+                text: value,
+                done: false,
+            });
             if let Some(agent) = state.agents.iter_mut().find(|a| a.id == id) {
-                agent.tasks.push(crate::domain::agent::AgentTask {
-                    text: value,
-                    done: false,
-                });
+                agent.tasks.clone_from(tasks);
                 state.agent_tab = AgentDetailTab::Tasks;
             }
         }
@@ -1388,8 +1549,65 @@ pub fn apply_prompt(
             };
             spawn_agent(state, services, request);
         }
-        PromptPurpose::InstallVsix | PromptPurpose::InspectVsix => {
-            state.warn("use `termloom extension install <file.vsix>` for now");
+        PromptPurpose::InstallVsix => {
+            if value.is_empty() {
+                return;
+            }
+            let path = expand_user_path(&value);
+            match crate::services::extensions::install(&path) {
+                Ok(report) => {
+                    let id = report.id.clone();
+                    reload_extensions(state);
+                    if let Some(index) = state
+                        .extensions
+                        .installed
+                        .iter()
+                        .position(|installed| installed.id == id)
+                    {
+                        state.extensions.selected = index;
+                    }
+                    state.layout.extensions = true;
+                    state.info(format!(
+                        "installed {} ({}) without executing extension code",
+                        report.id,
+                        report.class.label()
+                    ));
+                }
+                Err(err) => state.error(format!("could not install VSIX: {err:#}")),
+            }
+        }
+        PromptPurpose::InspectVsix => {
+            if value.is_empty() {
+                return;
+            }
+            let path = expand_user_path(&value);
+            match crate::services::extensions::inspect(&path) {
+                Ok(report) => {
+                    let mut lines = vec![format!(
+                        "{} {} — {}",
+                        report.display_name,
+                        report.version,
+                        report.class.label()
+                    )];
+                    lines.extend(report.capabilities.into_iter().map(|capability| {
+                        format!(
+                            "{} {} — {}",
+                            capability.support.glyph(),
+                            capability.name,
+                            capability.detail
+                        )
+                    }));
+                    lines.push("Extension code was not executed.".into());
+                    state.show_message("VSIX inspection", lines);
+                }
+                Err(err) => state.error(format!("could not inspect VSIX: {err:#}")),
+            }
+        }
+        PromptPurpose::DebugEvaluate => {
+            if value.is_empty() {
+                return;
+            }
+            debug_command(state, services, DebugCommand::Evaluate(value));
         }
         PromptPurpose::RenameSymbol(position) => {
             if value.is_empty() {
@@ -1412,6 +1630,56 @@ pub fn apply_prompt(
             }
         }
     }
+}
+
+/// Reload installed extension reports and register portable language mappings.
+pub fn reload_extensions(state: &mut AppState) {
+    match crate::services::extensions::list() {
+        Ok(mut reports) => {
+            reports.retain(|report| {
+                !state
+                    .config
+                    .extensions
+                    .disabled
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&report.id))
+            });
+            state.languages = crate::services::syntax::LanguageRegistry::new();
+            for report in &reports {
+                for asset in &report.assets {
+                    if let crate::domain::extensions::ExtensionAsset::Language {
+                        id,
+                        extensions,
+                        filenames,
+                        ..
+                    } = asset
+                    {
+                        state.languages.register(id, extensions, filenames);
+                    }
+                }
+            }
+            state.extensions.installed = reports;
+            state.snippets =
+                crate::services::extensions::load_snippets(&state.extensions.installed);
+            state.extensions.selected = state
+                .extensions
+                .selected
+                .min(state.extensions.installed.len().saturating_sub(1));
+        }
+        Err(err) => state.warn(format!("could not load installed extensions: {err:#}")),
+    }
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
 }
 
 /// Refresh the agent Files tab against the baseline captured at launch.

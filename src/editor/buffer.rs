@@ -43,13 +43,13 @@ pub struct TextBuffer {
 
 impl Default for TextBuffer {
     fn default() -> Self {
-        TextBuffer::from_str("")
+        TextBuffer::from_text("")
     }
 }
 
 impl TextBuffer {
     /// Build a buffer from file contents, remembering the line-ending style.
-    pub fn from_str(text: &str) -> TextBuffer {
+    pub fn from_text(text: &str) -> TextBuffer {
         let crlf = text.contains("\r\n");
         let normalised = text.replace("\r\n", "\n");
         let trailing_newline = normalised.ends_with('\n');
@@ -628,24 +628,24 @@ mod tests {
 
     #[test]
     fn preserves_line_endings_and_trailing_newline() {
-        let buf = TextBuffer::from_str("a\r\nb\r\n");
+        let buf = TextBuffer::from_text("a\r\nb\r\n");
         assert_eq!(buf.line_count(), 2);
         assert_eq!(buf.to_text(), "a\r\nb\r\n");
 
-        let buf = TextBuffer::from_str("a\nb");
+        let buf = TextBuffer::from_text("a\nb");
         assert_eq!(buf.to_text(), "a\nb");
     }
 
     #[test]
     fn empty_buffer_has_one_line() {
-        let buf = TextBuffer::from_str("");
+        let buf = TextBuffer::from_text("");
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.to_text(), "");
     }
 
     #[test]
     fn typing_and_newlines_update_the_cursor() {
-        let mut buf = TextBuffer::from_str("");
+        let mut buf = TextBuffer::from_text("");
         buf.insert("hello");
         assert_eq!(buf.cursor(), Position::new(0, 5));
         buf.insert_newline(false);
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn auto_indent_copies_leading_whitespace() {
-        let mut buf = TextBuffer::from_str("    let x = 1;");
+        let mut buf = TextBuffer::from_text("    let x = 1;");
         buf.move_document_end(false);
         buf.insert_newline(true);
         assert_eq!(buf.line(1), "    ");
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn dirty_flag_tracks_saves() {
-        let mut buf = TextBuffer::from_str("x");
+        let mut buf = TextBuffer::from_text("x");
         assert!(!buf.is_dirty());
         buf.insert("y");
         assert!(buf.is_dirty());
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn undo_and_redo_restore_exact_text() {
-        let mut buf = TextBuffer::from_str("one\ntwo\n");
+        let mut buf = TextBuffer::from_text("one\ntwo\n");
         buf.move_document_end(false);
         buf.insert("three");
         let after = buf.to_text();
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn typing_is_coalesced_into_one_undo_step() {
-        let mut buf = TextBuffer::from_str("");
+        let mut buf = TextBuffer::from_text("");
         for c in "hello".chars() {
             buf.insert_char(c);
         }
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn multiline_selection_delete_and_undo() {
-        let mut buf = TextBuffer::from_str("aaa\nbbb\nccc\n");
+        let mut buf = TextBuffer::from_text("aaa\nbbb\nccc\n");
         buf.move_to(Position::new(0, 1), false);
         buf.move_to(Position::new(2, 2), true);
         assert_eq!(buf.selected_text().unwrap(), "aa\nbbb\ncc");
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn utf8_columns_are_character_based() {
-        let mut buf = TextBuffer::from_str("héllo → wörld");
+        let mut buf = TextBuffer::from_text("héllo → wörld");
         buf.move_to(Position::new(0, 6), false);
         buf.insert("X");
         assert_eq!(buf.line(0), "héllo X→ wörld");
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn backspace_joins_lines() {
-        let mut buf = TextBuffer::from_str("ab\ncd");
+        let mut buf = TextBuffer::from_text("ab\ncd");
         buf.move_to(Position::new(1, 0), false);
         buf.delete_backward();
         assert_eq!(buf.to_text(), "abcd");
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn indent_and_dedent_operate_on_selected_lines() {
-        let mut buf = TextBuffer::from_str("a\nb\nc\n");
+        let mut buf = TextBuffer::from_text("a\nb\nc\n");
         buf.move_to(Position::new(0, 0), false);
         buf.move_to(Position::new(1, 1), true);
         buf.indent(2, true);
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn vertical_movement_keeps_the_goal_column() {
-        let mut buf = TextBuffer::from_str("longer line\nx\nanother long line\n");
+        let mut buf = TextBuffer::from_text("longer line\nx\nanother long line\n");
         buf.move_to(Position::new(0, 9), false);
         buf.move_vertical(1, false);
         assert_eq!(
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn word_motion_and_word_at_cursor() {
-        let mut buf = TextBuffer::from_str("let value = compute();");
+        let mut buf = TextBuffer::from_text("let value = compute();");
         buf.move_to(Position::new(0, 0), false);
         buf.move_word(true, false);
         assert_eq!(buf.cursor(), Position::new(0, 4));
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn home_toggles_between_indent_and_column_zero() {
-        let mut buf = TextBuffer::from_str("    indented");
+        let mut buf = TextBuffer::from_text("    indented");
         buf.move_document_end(false);
         buf.move_line_start(false);
         assert_eq!(buf.cursor(), Position::new(0, 4));

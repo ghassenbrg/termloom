@@ -11,6 +11,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::config::Config;
+
 /// Parse JSON with comments and trailing commas (the `.vscode` dialect).
 pub fn parse_jsonc(text: &str) -> Result<Value> {
     Ok(serde_json::from_str(&strip_jsonc(text))?)
@@ -130,6 +132,47 @@ pub fn read_settings(root: &Path) -> VsCodeSettings {
         Err(err) => {
             tracing::warn!(path = %path.display(), error = %err, "could not parse settings.json");
             VsCodeSettings::default()
+        }
+    }
+}
+
+/// Apply the unambiguous editor/workspace settings TermLoom understands.
+/// Explicit non-default TermLoom values win over VS Code imports.
+pub fn apply_settings(config: &mut Config, settings: &VsCodeSettings) {
+    let defaults = Config::default();
+    if config.editor.tab_width == defaults.editor.tab_width {
+        if let Some(value) = settings.tab_size {
+            config.editor.tab_width = value.max(1);
+        }
+    }
+    if config.editor.insert_spaces == defaults.editor.insert_spaces {
+        if let Some(value) = settings.insert_spaces {
+            config.editor.insert_spaces = value;
+        }
+    }
+    if config.editor.trim_trailing_whitespace == defaults.editor.trim_trailing_whitespace {
+        if let Some(value) = settings.trim_trailing_whitespace {
+            config.editor.trim_trailing_whitespace = value;
+        }
+    }
+    if config.editor.insert_final_newline == defaults.editor.insert_final_newline {
+        if let Some(value) = settings.insert_final_newline {
+            config.editor.insert_final_newline = value;
+        }
+    }
+    for pattern in &settings.files_exclude {
+        // The workspace scanner accepts directory names. Import common VS Code
+        // forms such as `**/coverage` without pretending to implement its full
+        // glob language.
+        let name = pattern
+            .strip_prefix("**/")
+            .unwrap_or(pattern)
+            .trim_end_matches("/**");
+        if !name.is_empty()
+            && !name.contains(['*', '?', '[', ']'])
+            && !config.workspace.ignore.iter().any(|entry| entry == name)
+        {
+            config.workspace.ignore.push(name.to_string());
         }
     }
 }
@@ -279,6 +322,30 @@ mod tests {
             ],
             "unknown settings are reported, not applied"
         );
+    }
+
+    #[test]
+    fn applies_supported_settings_without_overriding_explicit_values() {
+        let mut config = Config::with_builtin_defaults();
+        let settings = VsCodeSettings {
+            tab_size: Some(2),
+            insert_spaces: Some(false),
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            files_exclude: vec!["**/coverage".into(), "**/*.generated".into()],
+            ignored: Vec::new(),
+        };
+        apply_settings(&mut config, &settings);
+        assert_eq!(config.editor.tab_width, 2);
+        assert!(!config.editor.insert_spaces);
+        assert!(config.editor.trim_trailing_whitespace);
+        assert!(config.editor.insert_final_newline);
+        assert!(config.workspace.ignore.contains(&"coverage".into()));
+        assert!(!config.workspace.ignore.contains(&"*.generated".into()));
+
+        config.editor.tab_width = 8;
+        apply_settings(&mut config, &settings);
+        assert_eq!(config.editor.tab_width, 8);
     }
 
     #[test]

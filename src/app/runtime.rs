@@ -14,8 +14,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::config::Config;
+use crate::config::{Config, HerdrMode};
 use crate::domain::terminal::TerminalKind;
+use crate::services::agents::herdr::HerdrAgentBackend;
 use crate::services::agents::LocalAgentBackend;
 use crate::services::lsp::{LspEvent, LspManager, LspResult, LspSink, RequestKind};
 use crate::services::persistence::{self, LayoutRecord, TerminalRecord, WorkspaceState};
@@ -46,6 +47,7 @@ pub struct App {
     theme: Theme,
     layout: WorkbenchLayout,
     last_git_refresh: Instant,
+    last_external_agent_output: Instant,
     mouse_enabled: bool,
     /// Dropping this stops filesystem watching.
     _watcher: Option<WorkspaceWatcher>,
@@ -54,7 +56,18 @@ pub struct App {
 impl App {
     /// Build the workbench for a workspace.
     pub fn new(workspace: Workspace, initial_file: Option<PathBuf>) -> Result<App> {
-        let (config, config_diagnostics) = Config::load(Some(&workspace.root));
+        let (mut config, mut config_diagnostics) = Config::load(Some(&workspace.root));
+        let vscode_settings = crate::services::vscode::read_settings(&workspace.root);
+        crate::services::vscode::apply_settings(&mut config, &vscode_settings);
+        if !vscode_settings.ignored.is_empty() {
+            config_diagnostics.push(crate::config::ConfigDiagnostic {
+                path: workspace.root.join(".vscode/settings.json"),
+                message: format!(
+                    "ignored unsupported VS Code settings: {}",
+                    vscode_settings.ignored.join(", ")
+                ),
+            });
+        }
         let bus = EventBus::new();
 
         // Terminal sessions publish into the application channel.
@@ -89,6 +102,24 @@ impl App {
             Duration::from_secs(config.terminal.idle_after_secs),
         )));
 
+        let should_connect_herdr = config.herdr.mode == HerdrMode::Enabled
+            || (config.herdr.mode == HerdrMode::Auto
+                && std::env::var_os("HERDR_ENV").as_deref() == Some(std::ffi::OsStr::new("1")));
+        let herdr_error = if !should_connect_herdr {
+            None
+        } else {
+            match services
+                .runtime
+                .block_on(HerdrAgentBackend::connect(config.herdr.command.as_deref()))
+            {
+                Ok(backend) => {
+                    services.agents.push(Arc::new(backend));
+                    None
+                }
+                Err(err) => Some(format!("{err:#}")),
+            }
+        };
+
         let theme = Theme::by_name(&config.ui.theme);
         let mut state = AppState::new(workspace, config, config_diagnostics, terminals);
 
@@ -99,6 +130,13 @@ impl App {
                 diagnostic.message
             ));
         }
+        if let Some(error) = herdr_error {
+            if state.config.herdr.mode == HerdrMode::Enabled {
+                state.warn(format!("Herdr unavailable: {error}; using local agents"));
+            } else {
+                tracing::debug!(%error, "Herdr unavailable; using local agents");
+            }
+        }
 
         let mut app = App {
             state,
@@ -107,11 +145,19 @@ impl App {
             theme,
             layout: WorkbenchLayout::default(),
             last_git_refresh: Instant::now(),
+            last_external_agent_output: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
             mouse_enabled: false,
             _watcher: None,
         };
 
         app._watcher = app.start_watcher();
+        actions::reload_extensions(&mut app.state);
+        app.theme = Theme::by_name_or_extensions(
+            &app.state.config.ui.theme,
+            &app.state.extensions.installed,
+        );
         app.state.lsp_statuses = app.services.lsp.statuses();
 
         app.restore_session();
@@ -164,9 +210,20 @@ impl App {
                 self.state.lsp_message = Some(format!("{server}: {message}"));
             }
             LspEvent::Exited {
-                server, crashed, ..
+                server,
+                instance_id,
+                crashed,
+                ..
             } => {
-                self.services.lsp.forget(&server);
+                if crashed {
+                    self.services.lsp.record_failure(
+                        &server,
+                        instance_id,
+                        "server stopped unexpectedly",
+                    );
+                } else {
+                    self.services.lsp.forget(&server, instance_id);
+                }
                 self.state.lsp_statuses = self.services.lsp.statuses();
                 self.state.lsp_ready = self.services.lsp.any_ready();
                 if crashed {
@@ -199,7 +256,18 @@ impl App {
                     });
                 }
             }
-            (RequestKind::Completion, LspResult::Completion(items)) => {
+            (RequestKind::Completion, LspResult::Completion(mut items)) => {
+                if let Some(language) = self
+                    .state
+                    .document_for_path(&context.path)
+                    .map(|document| document.language.as_str().to_string())
+                {
+                    if let Some(snippets) = self.state.snippets.get(&language) {
+                        items.extend(snippets.iter().cloned());
+                        items.sort_by(|a, b| a.label.cmp(&b.label));
+                        items.dedup_by(|a, b| a.label == b.label && a.insert_text == b.insert_text);
+                    }
+                }
                 if items.is_empty() {
                     self.state.info("no completions");
                     self.state.completion = None;
@@ -318,7 +386,7 @@ impl App {
                     }
                 },
             };
-            file_edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+            file_edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
             if let Some(document) = self.state.document_mut(id) {
                 for edit in file_edits {
                     document.buffer.replace_range(edit.range, &edit.new_text);
@@ -457,16 +525,38 @@ impl App {
             DebugEvent::Exited { code } => {
                 self.state.info(format!("debuggee exited with code {code}"));
             }
-            DebugEvent::Terminated => {
-                self.state.debug.status = DebugStatus::Terminated;
-                self.state.debug.frames.clear();
-                self.state.debug.variables.clear();
-                self.state.debug.current_location = None;
-                self.services.debug = None;
+            DebugEvent::Terminated { session_id } => {
+                if self
+                    .services
+                    .debug
+                    .as_ref()
+                    .is_some_and(|session| session.session_id() == session_id)
+                {
+                    self.state.debug.status = DebugStatus::Terminated;
+                    self.state.debug.frames.clear();
+                    self.state.debug.variables.clear();
+                    self.state.debug.current_location = None;
+                    self.services.debug = None;
+                }
             }
-            DebugEvent::Failed { message } => {
-                self.state.debug.status = DebugStatus::Failed;
-                self.state.debug.last_error = Some(message.clone());
+            DebugEvent::Failed {
+                session_id,
+                message,
+                fatal,
+            } => {
+                if !self
+                    .services
+                    .debug
+                    .as_ref()
+                    .is_some_and(|session| session.session_id() == session_id)
+                {
+                    return;
+                }
+                if fatal {
+                    self.state.debug.status = DebugStatus::Failed;
+                    self.state.debug.last_error = Some(message.clone());
+                    self.services.debug = None;
+                }
                 self.state.error(message);
             }
         }
@@ -576,6 +666,12 @@ impl App {
                 true
             }
             AppEvent::AgentsUpdated(agents) => {
+                let mut agents = agents;
+                for agent in &mut agents {
+                    if let Some(tasks) = self.state.agent_tasks.get(&agent.id) {
+                        agent.tasks.clone_from(tasks);
+                    }
+                }
                 self.state.agents = agents;
                 self.state.agent_selection.clamp(self.state.agents.len());
                 true
@@ -616,7 +712,7 @@ impl App {
 
     /// Periodic housekeeping.
     fn on_tick(&mut self) -> bool {
-        actions::refresh_agents(&mut self.state, &mut self.services);
+        self.services.request_agent_refresh();
         self.state.expire_toasts(TOAST_LIFETIME);
         self.state.reconcile_terminal_focus();
         self.state.indexing = self.services.is_indexing();
@@ -727,18 +823,28 @@ impl App {
             self.state.agent_output.clear();
             return;
         };
-        let Some(terminal_id) = agent.terminal_id else {
-            self.state.agent_output.clear();
+        let (agent_id, terminal_id) = (agent.id, agent.terminal_id);
+        if let Some(terminal_id) = terminal_id {
+            self.state.agent_output = self
+                .state
+                .terminals
+                .lock()
+                .ok()
+                .and_then(|terminals| terminals.get(terminal_id).map(|s| s.snapshot().tail(200)))
+                .unwrap_or_default();
             return;
-        };
-        let lines = self
-            .state
-            .terminals
-            .lock()
-            .ok()
-            .and_then(|terminals| terminals.get(terminal_id).map(|s| s.snapshot().tail(200)))
-            .unwrap_or_default();
-        self.state.agent_output = lines;
+        }
+        if self.last_external_agent_output.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_external_agent_output = Instant::now();
+        let snapshot = self.services.runtime.block_on(async {
+            match self.services.agents.owner(agent_id).await {
+                Some(backend) => backend.snapshot(agent_id).await.ok(),
+                None => None,
+            }
+        });
+        self.state.agent_output = snapshot.map(|value| value.lines).unwrap_or_default();
     }
 
     // ── session persistence ───────────────────────────────────────────────

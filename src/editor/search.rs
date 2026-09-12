@@ -120,7 +120,7 @@ mod tests {
     use super::*;
 
     fn buffer() -> TextBuffer {
-        TextBuffer::from_str("alpha beta\nBETA gamma\nbeta\n")
+        TextBuffer::from_text("alpha beta\nBETA gamma\nbeta\n")
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn overlapping_matches_advance_past_the_hit() {
-        let buf = TextBuffer::from_str("aaaa");
+        let buf = TextBuffer::from_text("aaaa");
         assert_eq!(find_all(&buf, "aa", true).len(), 2);
     }
 
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn unicode_matches_use_character_columns() {
-        let buf = TextBuffer::from_str("héllo wörld");
+        let buf = TextBuffer::from_text("héllo wörld");
         let matches = find_all(&buf, "wörld", true);
         assert_eq!(matches[0], Range::single_line(0, 6, 11));
     }

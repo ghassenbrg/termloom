@@ -23,10 +23,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if !state.debug.status.is_active() {
         let mut lines = vec![Line::from(Span::styled(
-            match state.debug.last_error.as_deref() {
-                Some(error) => error,
-                None => "no debug session",
-            },
+            state
+                .debug
+                .last_error
+                .as_deref()
+                .unwrap_or("no debug session"),
             if state.debug.last_error.is_some() {
                 Style::default().fg(theme.danger)
             } else {
@@ -131,6 +132,22 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
     frame.render_widget(Paragraph::new(variables), columns[1]);
+
+    if inner.height > 1 {
+        let hint = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " F5 continue · F10/F11/F12 step · e evaluate ",
+                theme.dim(),
+            ))),
+            hint,
+        );
+    }
 }
 
 fn breakpoint_lines<'a>(state: &'a AppState, width: usize, theme: &Theme) -> Vec<Line<'a>> {

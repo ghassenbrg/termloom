@@ -27,6 +27,8 @@ pub struct Services {
     git_refreshing: Arc<AtomicBool>,
     /// Set while the quick-open index is being rebuilt.
     indexing: Arc<AtomicBool>,
+    /// Set while backend state is being refreshed away from the UI thread.
+    agent_refreshing: Arc<AtomicBool>,
 }
 
 impl Services {
@@ -39,6 +41,7 @@ impl Services {
             debug: None,
             git_refreshing: Arc::new(AtomicBool::new(false)),
             indexing: Arc::new(AtomicBool::new(false)),
+            agent_refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -87,5 +90,22 @@ impl Services {
 
     pub fn is_indexing(&self) -> bool {
         self.indexing.load(Ordering::SeqCst)
+    }
+
+    /// Refresh agent backends asynchronously. External backends may invoke a
+    /// CLI/socket with a timeout, so this work must never block a draw tick.
+    pub fn request_agent_refresh(&self) {
+        if self.agent_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let registry = self.agents.clone();
+        let events = self.events.clone();
+        let flag = Arc::clone(&self.agent_refreshing);
+        self.runtime.spawn(async move {
+            registry.refresh_all().await;
+            let agents = registry.list_all().await;
+            let _ = events.send(AppEvent::AgentsUpdated(agents));
+            flag.store(false, Ordering::SeqCst);
+        });
     }
 }

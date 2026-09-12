@@ -107,11 +107,15 @@ impl CompatibilityReport {
             .iter()
             .filter(|c| c.support == CapabilitySupport::Supported)
             .count();
+        let adaptable = capabilities
+            .iter()
+            .filter(|c| c.support == CapabilitySupport::NeedsAdaptation)
+            .count();
         let unsupported = capabilities
             .iter()
             .filter(|c| c.support == CapabilitySupport::Unsupported)
             .count();
-        if supported == 0 {
+        if supported == 0 && adaptable == 0 {
             CompatibilityClass::Unsupported
         } else if unsupported == 0
             && capabilities
@@ -220,10 +224,7 @@ mod tests {
 
     #[test]
     fn adaptation_only_is_partial_not_full() {
-        let caps = vec![
-            capability(CapabilitySupport::Supported),
-            capability(CapabilitySupport::NeedsAdaptation),
-        ];
+        let caps = vec![capability(CapabilitySupport::NeedsAdaptation)];
         assert_eq!(
             CompatibilityReport::classify(&caps),
             CompatibilityClass::Partial

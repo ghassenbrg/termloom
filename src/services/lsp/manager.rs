@@ -4,7 +4,7 @@
 //! of a language they declare is opened. A crashed server is reported and can
 //! be restarted; it never takes the workbench down with it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -35,6 +35,8 @@ pub struct LspManager {
     sink: LspSink,
     /// Servers that failed to start, with the reason, so the UI can explain.
     failures: HashMap<String, String>,
+    /// Servers explicitly stopped by the user.
+    suppressed: HashSet<String>,
 }
 
 impl LspManager {
@@ -49,6 +51,7 @@ impl LspManager {
             root: root.to_path_buf(),
             sink,
             failures: HashMap::new(),
+            suppressed: HashSet::new(),
         }
     }
 
@@ -59,6 +62,8 @@ impl LspManager {
             .iter()
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect();
+        self.failures.clear();
+        self.suppressed.clear();
     }
 
     /// Name of the configured server for a language, if any.
@@ -130,6 +135,7 @@ impl LspManager {
         match LspClient::start(&name, &config, &root, self.sink.clone()) {
             Ok(client) => {
                 self.failures.remove(&name);
+                self.suppressed.remove(&name);
                 self.clients.insert(name.clone(), client);
                 Ok(name)
             }
@@ -162,10 +168,13 @@ impl LspManager {
 
     /// Whether a server should start automatically for this language.
     pub fn auto_start(&self, language: &LanguageId) -> bool {
-        self.server_for(language)
-            .and_then(|name| self.configs.get(&name))
-            .map(|config| config.auto_start)
-            .unwrap_or(false)
+        self.server_for(language).is_some_and(|name| {
+            self.configs
+                .get(&name)
+                .is_some_and(|config| config.auto_start)
+                && !self.failures.contains_key(&name)
+                && !self.suppressed.contains(&name)
+        })
     }
 
     fn client_for(&mut self, language: &LanguageId) -> Option<&mut LspClient> {
@@ -312,14 +321,23 @@ impl LspManager {
             .cloned()
             .ok_or_else(|| anyhow!("no server named {name}"))?;
         let root = self.project_root(&config);
-        let client = LspClient::start(name, &config, &root, self.sink.clone())?;
-        self.clients.insert(name.to_string(), client);
-        self.failures.remove(name);
-        Ok(())
+        self.suppressed.remove(name);
+        match LspClient::start(name, &config, &root, self.sink.clone()) {
+            Ok(client) => {
+                self.clients.insert(name.to_string(), client);
+                self.failures.remove(name);
+                Ok(())
+            }
+            Err(error) => {
+                self.failures.insert(name.to_string(), format!("{error:#}"));
+                Err(error)
+            }
+        }
     }
 
     /// Stop a server by name.
     pub fn stop(&mut self, name: &str) {
+        self.suppressed.insert(name.to_string());
         if let Some(mut client) = self.clients.remove(name) {
             client.shutdown();
         }
@@ -338,8 +356,27 @@ impl LspManager {
     }
 
     /// Mark a crashed server so a later request can restart it.
-    pub fn forget(&mut self, name: &str) {
-        self.clients.remove(name);
+    pub fn forget(&mut self, name: &str, instance_id: u64) {
+        if self
+            .clients
+            .get(name)
+            .is_some_and(|client| client.instance_id() == instance_id)
+        {
+            self.clients.remove(name);
+        }
+    }
+
+    /// Remember an unexpected exit so the automatic start tick cannot create
+    /// a tight crash loop. An explicit start/restart may retry immediately.
+    pub fn record_failure(&mut self, name: &str, instance_id: u64, message: impl Into<String>) {
+        if self
+            .clients
+            .get(name)
+            .is_some_and(|client| client.instance_id() == instance_id)
+        {
+            self.clients.remove(name);
+            self.failures.insert(name.to_string(), message.into());
+        }
     }
 }
 
@@ -442,5 +479,20 @@ mod tests {
         assert!(manager(config.clone()).auto_start(&LanguageId::new("rust")));
         config.lsp.get_mut("rust-analyzer").unwrap().auto_start = false;
         assert!(!manager(config).auto_start(&LanguageId::new("rust")));
+    }
+
+    #[test]
+    fn a_crash_or_manual_stop_suspends_auto_restart() {
+        let rust = LanguageId::new("rust");
+        let mut crashed = manager(Config::with_builtin_defaults());
+        assert!(crashed.auto_start(&rust));
+        crashed
+            .failures
+            .insert("rust-analyzer".into(), "crashed".into());
+        assert!(!crashed.auto_start(&rust));
+
+        let mut stopped = manager(Config::with_builtin_defaults());
+        stopped.stop("rust-analyzer");
+        assert!(!stopped.auto_start(&rust));
     }
 }

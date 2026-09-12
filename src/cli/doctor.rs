@@ -1,7 +1,8 @@
 //! `termloom doctor` — report what is available on this machine.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -85,7 +86,7 @@ pub fn collect_checks() -> Vec<Check> {
     checks.push(binary_check("git", &["--version"], true));
     checks.push(binary_check("claude", &["--version"], false));
     checks.push(binary_check("codex", &["--version"], false));
-    checks.push(binary_check("herdr", &["--version"], false));
+    checks.push(herdr_check());
     checks.push(binary_check("rust-analyzer", &["--version"], false));
 
     let config_path = crate::config::global_config_path();
@@ -143,6 +144,104 @@ fn binary_check(program: &str, version_args: &[&str], required: bool) -> Check {
             } else {
                 "not found on PATH (optional)".into()
             },
+        },
+    }
+}
+
+fn herdr_check() -> Check {
+    let Some(path) = which("herdr") else {
+        return Check {
+            name: "herdr".into(),
+            status: CheckStatus::Missing,
+            detail: "not found on PATH (optional)".into(),
+        };
+    };
+    let mut child = match Command::new(&path)
+        .args(["status", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Check {
+                name: "herdr".into(),
+                status: CheckStatus::Missing,
+                detail: format!("installed but could not be started: {error}"),
+            };
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Check {
+                    name: "herdr".into(),
+                    status: CheckStatus::Missing,
+                    detail: "installed, but the status probe timed out (optional)".into(),
+                };
+            }
+            Err(error) => {
+                return Check {
+                    name: "herdr".into(),
+                    status: CheckStatus::Missing,
+                    detail: format!("installed, but status could not be read: {error}"),
+                };
+            }
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            return Check {
+                name: "herdr".into(),
+                status: CheckStatus::Missing,
+                detail: format!("installed, but status output could not be read: {error}"),
+            };
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return Check {
+                name: "herdr".into(),
+                status: CheckStatus::Missing,
+                detail: "installed, but no reachable compatible session was reported".into(),
+            };
+        }
+    };
+    let running = value
+        .pointer("/server/running")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let compatible = value
+        .pointer("/server/compatible")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let version = value
+        .pointer("/server/version")
+        .or_else(|| value.pointer("/client/version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    Check {
+        name: "herdr".into(),
+        status: if running && compatible {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Missing
+        },
+        detail: if !running {
+            format!("{version} installed; no running session (optional)")
+        } else if !compatible {
+            format!("{version} session uses an incompatible protocol (optional)")
+        } else {
+            format!("{version}; reachable session")
         },
     }
 }

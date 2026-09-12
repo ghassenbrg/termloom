@@ -541,12 +541,7 @@ impl App {
                 self.state.info(format!("debuggee exited with code {code}"));
             }
             DebugEvent::Terminated { session_id } => {
-                if self
-                    .services
-                    .debug
-                    .as_ref()
-                    .is_some_and(|session| session.session_id() == session_id)
-                {
+                if self.is_current_debug_session(session_id) {
                     self.state.debug.status = DebugStatus::Terminated;
                     self.state.debug.frames.clear();
                     self.state.debug.variables.clear();
@@ -559,12 +554,7 @@ impl App {
                 message,
                 fatal,
             } => {
-                if !self
-                    .services
-                    .debug
-                    .as_ref()
-                    .is_some_and(|session| session.session_id() == session_id)
-                {
+                if !self.is_current_debug_session(session_id) {
                     return;
                 }
                 if fatal {
@@ -575,6 +565,18 @@ impl App {
                 self.state.error(message);
             }
         }
+    }
+
+    /// Whether an event belongs to the debug session currently owned.
+    ///
+    /// A terminating adapter can report after the user has started another
+    /// one; acting on those events would wipe the live session's state.
+    fn is_current_debug_session(&self, session_id: u64) -> bool {
+        self.services
+            .debug
+            .as_ref()
+            .map(|session| session.session_id())
+            == Some(session_id)
     }
 
     /// Open the source of a stack frame and mark the execution point.

@@ -12,7 +12,6 @@ use std::time::Duration;
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::domain::agent::AgentSession;
-use crate::domain::diagnostics::Diagnostic;
 use crate::domain::git::GitSnapshot;
 use crate::domain::ids::TerminalId;
 use crate::services::workspace::FileIndex;
@@ -37,29 +36,14 @@ pub enum AppEvent {
     AgentsUpdated(Vec<AgentSession>),
     /// Quick-open index finished scanning.
     FileIndexed(FileIndex),
-    /// Diagnostics published by a language server.
-    Diagnostics {
-        server: String,
-        path: PathBuf,
-        diagnostics: Vec<Diagnostic>,
-    },
-    /// A language server changed state (started, crashed, stopped).
-    LanguageServer(LanguageServerEvent),
+    /// Anything a language server reported: diagnostics, responses, status.
+    Lsp(Box<crate::services::lsp::LspEvent>),
     /// A debug adapter event.
     Debug(DebugEvent),
     /// Something to show the user.
     Notice(Notice),
     /// Quit requested by a background task.
     Quit,
-}
-
-/// Language server lifecycle notifications.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LanguageServerEvent {
-    Initialized { server: String },
-    Stopped { server: String },
-    Crashed { server: String, message: String },
-    Progress { server: String, message: String },
 }
 
 /// Debug session notifications.

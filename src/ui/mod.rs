@@ -12,6 +12,7 @@ pub mod explorer;
 pub mod extensions;
 pub mod git;
 pub mod help;
+pub mod lsp;
 pub mod modal;
 pub mod outline;
 pub mod palette;
@@ -70,6 +71,7 @@ pub struct WorkbenchLayout {
     pub explorer: Option<Rect>,
     pub outline: Option<Rect>,
     pub git: Option<Rect>,
+    pub lsp: Option<Rect>,
     pub editor_tabs: Option<Rect>,
     pub editor: Option<Rect>,
     pub bottom_panel: Option<Rect>,
@@ -249,9 +251,11 @@ fn draw_sidebar(
     layout: &mut WorkbenchLayout,
     mode: LayoutMode,
 ) {
-    // Outline is the first thing to go when vertical room is tight.
+    // Outline is the first thing to go when vertical room is tight, then the
+    // language-server block.
     let show_outline = state.layout.outline && mode == LayoutMode::Large && area.height >= 26;
     let show_git = state.layout.git && area.height >= 16;
+    let show_lsp = mode == LayoutMode::Large && area.height >= 34;
 
     let mut constraints = vec![Constraint::Min(6)];
     if show_outline {
@@ -259,6 +263,9 @@ fn draw_sidebar(
     }
     if show_git {
         constraints.push(Constraint::Length((area.height / 3).max(6)));
+    }
+    if show_lsp {
+        constraints.push(Constraint::Length((state.lsp_statuses.len() as u16).clamp(2, 4) + 2));
     }
 
     let rows = Layout::default()
@@ -280,6 +287,11 @@ fn draw_sidebar(
     if show_git {
         git::draw(frame, rows[index], state, theme);
         layout.git = Some(rows[index]);
+        index += 1;
+    }
+    if show_lsp {
+        lsp::draw(frame, rows[index], state, theme);
+        layout.lsp = Some(rows[index]);
     }
 }
 

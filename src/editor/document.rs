@@ -65,6 +65,8 @@ pub struct Document {
     /// Lines carrying a debug breakpoint (0-based).
     pub breakpoints: BTreeSet<usize>,
     pub search: SearchState,
+    /// Buffer version last sent to a language server (-1 = never opened).
+    pub synced_version: i64,
     disk: Option<DiskState>,
     pub external_change: ExternalChange,
     pub read_only: bool,
@@ -107,6 +109,7 @@ impl Document {
             diagnostics: Vec::new(),
             breakpoints: BTreeSet::new(),
             search: SearchState::default(),
+            synced_version: -1,
             disk: DiskState::read(path),
             external_change: ExternalChange::None,
             read_only,
@@ -129,6 +132,7 @@ impl Document {
             diagnostics: Vec::new(),
             breakpoints: BTreeSet::new(),
             search: SearchState::default(),
+            synced_version: -1,
             disk: None,
             external_change: ExternalChange::None,
             read_only: false,

@@ -3,11 +3,11 @@
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::focus::FocusTarget;
-use crate::app::state::AppState;
+use crate::app::state::{AppState, CompletionPopup};
 use crate::domain::git::DiffLine;
 use crate::editor::Document;
 
@@ -65,6 +65,145 @@ pub fn draw(
 
     layout.editor = Some(body);
     draw_buffer(frame, body, state, document, theme, focused);
+
+    // Language-service popups sit on top of the text.
+    if let Some(completion) = &state.completion {
+        draw_completion(frame, body, document, completion, theme);
+    }
+    if let Some(hover) = &state.hover {
+        draw_hover(frame, body, document, hover, theme);
+    }
+}
+
+/// Completion list anchored under the cursor.
+fn draw_completion(
+    frame: &mut Frame,
+    area: Rect,
+    document: &Document,
+    completion: &CompletionPopup,
+    theme: &Theme,
+) {
+    let items = completion.filtered();
+    if items.is_empty() {
+        return;
+    }
+    let width = items
+        .iter()
+        .map(|item| {
+            item.label.chars().count()
+                + item.kind.as_ref().map(|k| k.len() + 2).unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(20)
+        .clamp(16, 48) as u16
+        + 2;
+    let height = (items.len() as u16 + 2).min(10);
+    let rect = anchor_below(area, document, completion.position, width, height);
+
+    let lines: Vec<Line> = items
+        .iter()
+        .take(height.saturating_sub(2) as usize)
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == completion.selected;
+            let kind = item
+                .kind
+                .as_ref()
+                .map(|k| format!(" {k}"))
+                .unwrap_or_default();
+            let style = if selected {
+                theme.selected_row(true)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(vec![
+                Span::styled(item.label.clone(), style),
+                Span::styled(kind, theme.dim()),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent))
+                    .title(Span::styled(" completion ", theme.dim())),
+            )
+            .style(Style::default().bg(theme.surface)),
+        rect,
+    );
+}
+
+/// Hover documentation next to the cursor.
+fn draw_hover(
+    frame: &mut Frame,
+    area: Rect,
+    document: &Document,
+    hover: &crate::app::state::HoverPopup,
+    theme: &Theme,
+) {
+    let width = hover
+        .lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(20)
+        .clamp(20, 70) as u16
+        + 2;
+    let height = (hover.lines.len() as u16 + 2).min(12);
+    let rect = anchor_below(area, document, hover.position, width, height);
+
+    let lines: Vec<Line> = hover
+        .lines
+        .iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                truncate(line, width.saturating_sub(2) as usize),
+                Style::default().fg(theme.text),
+            ))
+        })
+        .collect();
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent_alt))
+                    .title(Span::styled(" hover · Esc to close ", theme.dim())),
+            )
+            .style(Style::default().bg(theme.surface)),
+        rect,
+    );
+}
+
+/// Place a popup under a buffer position, flipping up near the bottom edge.
+fn anchor_below(
+    area: Rect,
+    document: &Document,
+    position: crate::domain::diagnostics::Position,
+    width: u16,
+    height: u16,
+) -> Rect {
+    let gutter = document.buffer.line_count().to_string().len() as u16 + 2;
+    let x = (area.x + gutter + position.character.saturating_sub(document.h_scroll) as u16)
+        .min(area.x + area.width.saturating_sub(width));
+    let cursor_y = area.y + position.line.saturating_sub(document.scroll) as u16;
+    let y = if cursor_y + 1 + height <= area.y + area.height {
+        cursor_y + 1
+    } else {
+        cursor_y.saturating_sub(height).max(area.y)
+    };
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }
 
 /// Compact tab strip: `[● main.rs] [app.dart]`.

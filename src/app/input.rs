@@ -272,6 +272,17 @@ fn forward_to_terminal(state: &mut AppState, id: crate::domain::ids::TerminalId,
 // ── editor ────────────────────────────────────────────────────────────────
 
 fn handle_editor_key(state: &mut AppState, services: &mut Services, key: KeyEvent) -> bool {
+    // A completion popup grabs navigation keys while it is open.
+    if state.completion.is_some() && handle_completion_key(state, key) {
+        return true;
+    }
+    // Any key other than Esc dismisses hover; Esc closes it explicitly.
+    if state.hover.is_some() {
+        state.hover = None;
+        if key.code == KeyCode::Esc {
+            return true;
+        }
+    }
     // A diff view takes over the editor area.
     if state.diff.is_some() {
         match key.code {
@@ -398,6 +409,103 @@ fn handle_editor_key(state: &mut AppState, services: &mut Services, key: KeyEven
         }
         _ => false,
     }
+}
+
+/// Keys handled while the completion popup is open.
+fn handle_completion_key(state: &mut AppState, key: KeyEvent) -> bool {
+    let Some(completion) = state.completion.as_mut() else {
+        return false;
+    };
+    let count = completion.filtered().len();
+    match key.code {
+        KeyCode::Up => {
+            completion.selected = completion.selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                completion.selected = (completion.selected + 1).min(count - 1);
+            }
+            true
+        }
+        KeyCode::Esc => {
+            state.completion = None;
+            true
+        }
+        KeyCode::Enter | KeyCode::Tab => {
+            accept_completion(state);
+            true
+        }
+        KeyCode::Backspace => {
+            // Let the editor delete, then keep the popup in sync.
+            if let Some(document) = state.active_document_mut() {
+                document.buffer.delete_backward();
+            }
+            update_completion_prefix(state);
+            true
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && (c.is_alphanumeric() || c == '_') =>
+        {
+            if let Some(document) = state.active_document_mut() {
+                document.buffer.insert_char(c);
+            }
+            update_completion_prefix(state);
+            true
+        }
+        _ => {
+            // Anything else (space, punctuation, movement) closes the popup
+            // and is handled normally by the editor.
+            state.completion = None;
+            false
+        }
+    }
+}
+
+/// Re-read the word under the cursor after typing or deleting.
+fn update_completion_prefix(state: &mut AppState) {
+    let prefix = state
+        .active_document()
+        .map(|document| {
+            let cursor = document.buffer.cursor();
+            document.buffer.word_at(cursor).unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let close = match state.completion.as_mut() {
+        Some(completion) => {
+            completion.prefix = prefix;
+            completion.selected = 0;
+            completion.filtered().is_empty()
+        }
+        None => false,
+    };
+    if close {
+        state.completion = None;
+    }
+}
+
+/// Replace the typed prefix with the selected item.
+fn accept_completion(state: &mut AppState) {
+    let Some(completion) = state.completion.take() else {
+        return;
+    };
+    let Some(item) = completion.selection() else {
+        return;
+    };
+    let Some(document) = state.active_document_mut() else {
+        return;
+    };
+    let cursor = document.buffer.cursor();
+    let prefix_len = completion.prefix.chars().count();
+    let start = crate::domain::diagnostics::Position::new(
+        cursor.line,
+        cursor.character.saturating_sub(prefix_len),
+    );
+    document.buffer.replace_range(
+        crate::domain::diagnostics::Range::new(start, cursor),
+        &item.insert_text,
+    );
 }
 
 // ── explorer ──────────────────────────────────────────────────────────────
@@ -654,6 +762,9 @@ fn handle_agent_detail_key(state: &mut AppState, services: &mut Services, key: K
 // ── problems / debug ──────────────────────────────────────────────────────
 
 fn handle_problems_key(state: &mut AppState, key: KeyEvent) -> bool {
+    if state.references.is_some() {
+        return handle_references_key(state, key);
+    }
     let len = state.problems.len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -691,6 +802,52 @@ fn handle_problems_key(state: &mut AppState, key: KeyEvent) -> bool {
                 Some(id) => FocusTarget::Editor(id),
                 None => FocusTarget::Explorer,
             };
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_references_key(state: &mut AppState, key: KeyEvent) -> bool {
+    let len = state
+        .references
+        .as_ref()
+        .map(|r| r.locations.len())
+        .unwrap_or(0);
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(references) = state.references.as_mut() {
+                references.selected = references.selected.saturating_sub(1);
+            }
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(references) = state.references.as_mut() {
+                if len > 0 {
+                    references.selected = (references.selected + 1).min(len - 1);
+                }
+            }
+            true
+        }
+        KeyCode::Enter => {
+            let location = state
+                .references
+                .as_ref()
+                .and_then(|r| r.locations.get(r.selected).cloned());
+            if let Some(location) = location {
+                match state.open_file(&location.path) {
+                    Ok(id) => {
+                        if let Some(document) = state.document_mut(id) {
+                            document.goto(location.range.start);
+                        }
+                    }
+                    Err(err) => state.error(format!("{err:#}")),
+                }
+            }
+            true
+        }
+        KeyCode::Esc => {
+            state.references = None;
             true
         }
         _ => false,

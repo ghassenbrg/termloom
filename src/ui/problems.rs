@@ -13,6 +13,11 @@ use super::widgets::{panel_with_hint, window};
 use super::{truncate, Theme};
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // The same slot shows references when a lookup produced some.
+    if state.references.is_some() {
+        draw_references(frame, area, state, theme);
+        return;
+    }
     let focused = state.focus == FocusTarget::Problems;
     let (errors, warnings) = state.problem_counts();
     let block = panel_with_hint(
@@ -81,5 +86,59 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         })
         .collect();
 
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Results of `lsp.references`.
+fn draw_references(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(references) = &state.references else {
+        return;
+    };
+    let focused = state.focus == FocusTarget::Problems;
+    let block = panel_with_hint(
+        "REFERENCES",
+        format!(
+            "{} · {} results · Esc back to problems",
+            references.query,
+            references.locations.len()
+        ),
+        focused,
+        theme,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let height = inner.height as usize;
+    let offset = window(references.selected, references.locations.len(), height, 0);
+    let lines: Vec<Line> = references
+        .locations
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(index, location)| {
+            let name = location
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = format!(
+                "{name}:{}:{}",
+                location.range.start.line + 1,
+                location.range.start.character + 1
+            );
+            let mut span = Span::styled(
+                truncate(&text, inner.width as usize),
+                Style::default().fg(theme.text),
+            );
+            if index == references.selected {
+                span = Span::styled(span.content, span.style.patch(theme.selected_row(focused)));
+            }
+            Line::from(span)
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }

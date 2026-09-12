@@ -19,6 +19,8 @@ use crate::domain::extensions::CompatibilityReport;
 use crate::domain::git::{FileDiff, GitSnapshot};
 use crate::domain::ids::{AgentId, EditorTabId, TerminalId};
 use crate::editor::Document;
+use crate::domain::diagnostics::Location;
+use crate::services::lsp::{CompletionItem, ServerStatus};
 use crate::services::syntax::{Highlighter, LanguageRegistry, OutlineExtractor};
 use crate::services::terminal::TerminalManager;
 use crate::services::workspace::{FileIndex, FileTree, ScanOptions, Workspace};
@@ -249,6 +251,51 @@ impl ListSelection {
     }
 }
 
+/// Hover documentation shown next to the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverPopup {
+    pub lines: Vec<String>,
+    /// Buffer position the hover was requested for.
+    pub position: Position,
+}
+
+/// Completion popup anchored at the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionPopup {
+    pub items: Vec<CompletionItem>,
+    pub selected: usize,
+    /// Position the request was made from.
+    pub position: Position,
+    /// Word already typed, replaced when an item is accepted.
+    pub prefix: String,
+}
+
+impl CompletionPopup {
+    /// Items matching the typed prefix.
+    pub fn filtered(&self) -> Vec<&CompletionItem> {
+        if self.prefix.is_empty() {
+            return self.items.iter().collect();
+        }
+        let prefix = self.prefix.to_lowercase();
+        self.items
+            .iter()
+            .filter(|item| item.label.to_lowercase().starts_with(&prefix))
+            .collect()
+    }
+
+    pub fn selection(&self) -> Option<CompletionItem> {
+        self.filtered().get(self.selected).map(|item| (*item).clone())
+    }
+}
+
+/// Results of `lsp.references`, shown in the bottom panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferencesView {
+    pub query: String,
+    pub locations: Vec<Location>,
+    pub selected: usize,
+}
+
 /// Debug panel state, filled by the DAP client.
 #[derive(Debug, Default)]
 pub struct DebugUiState {
@@ -322,6 +369,15 @@ pub struct AppState {
     pub debug: DebugUiState,
     pub extensions: ExtensionsUiState,
 
+    // ── language services ─────────────────────────────────────────────────
+    pub hover: Option<HoverPopup>,
+    pub completion: Option<CompletionPopup>,
+    pub references: Option<ReferencesView>,
+    /// Configured servers and their live state, for the sidebar.
+    pub lsp_statuses: Vec<ServerStatus>,
+    /// Last status message a server reported.
+    pub lsp_message: Option<String>,
+
     // ── overlays ──────────────────────────────────────────────────────────
     pub palette: Option<PaletteState>,
     pub modal: Option<Modal>,
@@ -393,6 +449,11 @@ impl AppState {
             problems_selection: ListSelection::default(),
             debug: DebugUiState::default(),
             extensions: ExtensionsUiState::default(),
+            hover: None,
+            completion: None,
+            references: None,
+            lsp_statuses: Vec::new(),
+            lsp_message: None,
             palette: None,
             modal: None,
             toasts: Vec::new(),
@@ -477,7 +538,12 @@ impl AppState {
     }
 
     /// Open a file, or focus the tab that already has it.
+    ///
+    /// Paths are canonicalised first: language servers and git report resolved
+    /// paths, and without this the same file could end up in two tabs.
     pub fn open_file(&mut self, path: &Path) -> Result<EditorTabId> {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = canonical.as_path();
         if let Some(existing) = self.document_for_path(path).map(|d| d.id) {
             self.activate_tab(existing);
             return Ok(existing);
@@ -762,9 +828,15 @@ impl AppState {
         }
     }
 
-    /// Overridden once the LSP manager is wired in.
+    /// True when at least one language server finished initialising.
     pub fn language_server_available(&self) -> bool {
         self.lsp_ready
+    }
+
+    /// Dismiss language-service popups (on cursor moves, edits, Esc).
+    pub fn dismiss_popups(&mut self) {
+        self.hover = None;
+        self.completion = None;
     }
 
     pub fn debug_session_active(&self) -> bool {

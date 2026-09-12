@@ -156,6 +156,25 @@ pub fn draw_status(
         }
     }
 
+    // Language service state, so the user knows whether intelligence is live.
+    let running: Vec<&str> = state
+        .lsp_statuses
+        .iter()
+        .filter(|server| server.running && server.status == crate::services::lsp::ClientStatus::Ready)
+        .map(|server| server.name.as_str())
+        .collect();
+    if !state.lsp_statuses.is_empty() {
+        left.push(Span::styled("│ ", Style::default().fg(theme.border)));
+        if running.is_empty() {
+            left.push(Span::styled("LSP off ", Style::default().fg(theme.text_dim)));
+        } else {
+            left.push(Span::styled(
+                format!("LSP {} ✓ ", running.join(",")),
+                Style::default().fg(theme.success),
+            ));
+        }
+    }
+
     let mut right: Vec<Span> = Vec::new();
     if let Some(document) = state.active_document() {
         let cursor = document.buffer.cursor();

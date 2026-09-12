@@ -17,8 +17,10 @@ use ratatui::Terminal;
 use crate::config::Config;
 use crate::domain::terminal::TerminalKind;
 use crate::services::agents::LocalAgentBackend;
+use crate::services::lsp::{LspEvent, LspManager, LspResult, LspSink, RequestKind};
 use crate::services::persistence::{self, LayoutRecord, TerminalRecord, WorkspaceState};
 use crate::services::terminal::{EventSink, SpawnSpec, TerminalEvent, TerminalManager};
+use crate::services::watcher::WorkspaceWatcher;
 use crate::services::workspace::{ScanOptions, Workspace};
 use crate::ui::{self, Theme, WorkbenchLayout};
 
@@ -45,6 +47,8 @@ pub struct App {
     layout: WorkbenchLayout,
     last_git_refresh: Instant,
     mouse_enabled: bool,
+    /// Dropping this stops filesystem watching.
+    _watcher: Option<WorkspaceWatcher>,
 }
 
 impl App {
@@ -72,7 +76,14 @@ impl App {
             .build()
             .context("starting the async runtime")?;
 
-        let mut services = super::services::Services::new(bus.sender.clone(), runtime);
+        // Language servers publish into the same channel as everything else.
+        let sender = bus.sender.clone();
+        let lsp_sink: LspSink = Arc::new(move |event| {
+            let _ = sender.send(AppEvent::Lsp(Box::new(event)));
+        });
+        let lsp = LspManager::new(&config, &workspace.root, lsp_sink);
+
+        let mut services = super::services::Services::new(bus.sender.clone(), runtime, lsp);
         services.agents.push(Arc::new(LocalAgentBackend::new(
             Arc::clone(&terminals),
             Duration::from_secs(config.terminal.idle_after_secs),
@@ -97,7 +108,11 @@ impl App {
             layout: WorkbenchLayout::default(),
             last_git_refresh: Instant::now(),
             mouse_enabled: false,
+            _watcher: None,
         };
+
+        app._watcher = app.start_watcher();
+        app.state.lsp_statuses = app.services.lsp.statuses();
 
         app.restore_session();
         if let Some(path) = initial_file {
@@ -111,6 +126,280 @@ impl App {
         let _ = persistence::RecentWorkspaces::record(&app.state.workspace.root);
 
         Ok(app)
+    }
+
+    /// Apply an event coming from a language server.
+    fn on_lsp_event(&mut self, event: LspEvent) {
+        match event {
+            LspEvent::Initialized {
+                server,
+                capabilities,
+            } => {
+                self.state.lsp_ready = true;
+                self.state.lsp_statuses = self.services.lsp.statuses();
+                tracing::info!(server = %server, ?capabilities, "language server ready");
+                self.state.info(format!("{server} ready"));
+                // Open everything already on screen.
+                self.sync_open_documents(true);
+            }
+            LspEvent::Diagnostics {
+                path, diagnostics, ..
+            } => {
+                self.state.set_diagnostics(&path, diagnostics);
+            }
+            LspEvent::Response {
+                kind,
+                context,
+                result,
+                ..
+            } => self.on_lsp_response(kind, context, result),
+            LspEvent::RequestFailed {
+                server,
+                kind,
+                message,
+            } => self
+                .state
+                .warn(format!("{server} {}: {message}", kind.label())),
+            LspEvent::Status { server, message } => {
+                self.state.lsp_message = Some(format!("{server}: {message}"));
+            }
+            LspEvent::Exited {
+                server, crashed, ..
+            } => {
+                self.services.lsp.forget(&server);
+                self.state.lsp_statuses = self.services.lsp.statuses();
+                self.state.lsp_ready = self.services.lsp.any_ready();
+                if crashed {
+                    self.state.error(format!(
+                        "{server} stopped unexpectedly — restart it with lsp.restart"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn on_lsp_response(
+        &mut self,
+        kind: RequestKind,
+        context: crate::services::lsp::RequestContext,
+        result: LspResult,
+    ) {
+        match (kind, result) {
+            (RequestKind::Hover, LspResult::Hover(lines)) => {
+                let lines: Vec<String> = lines
+                    .into_iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                if lines.is_empty() {
+                    self.state.info("no hover information");
+                } else {
+                    self.state.hover = Some(crate::app::state::HoverPopup {
+                        lines,
+                        position: context.position,
+                    });
+                }
+            }
+            (RequestKind::Completion, LspResult::Completion(items)) => {
+                if items.is_empty() {
+                    self.state.info("no completions");
+                    self.state.completion = None;
+                } else {
+                    let prefix = self
+                        .state
+                        .active_document()
+                        .and_then(|d| d.buffer.word_at(context.position))
+                        .unwrap_or_default();
+                    self.state.completion = Some(crate::app::state::CompletionPopup {
+                        items,
+                        selected: 0,
+                        position: context.position,
+                        prefix,
+                    });
+                }
+            }
+            (RequestKind::Definition, LspResult::Locations(locations)) => {
+                match locations.first().cloned() {
+                    Some(location) => self.navigate_to(location),
+                    None => self.state.info("no definition found"),
+                }
+            }
+            (RequestKind::References, LspResult::Locations(locations)) => {
+                if locations.is_empty() {
+                    self.state.info("no references found");
+                    return;
+                }
+                let query = self
+                    .state
+                    .active_document()
+                    .and_then(|d| d.buffer.word_at(context.position))
+                    .unwrap_or_else(|| "symbol".into());
+                self.state.references = Some(crate::app::state::ReferencesView {
+                    query,
+                    locations,
+                    selected: 0,
+                });
+                self.state.layout.problems = true;
+                self.state.focus = crate::app::focus::FocusTarget::Problems;
+            }
+            (RequestKind::DocumentSymbols, LspResult::Symbols(symbols)) => {
+                if let Some(document) = self
+                    .state
+                    .documents
+                    .iter_mut()
+                    .find(|d| d.path.as_deref() == Some(context.path.as_path()))
+                {
+                    if !symbols.is_empty() {
+                        document.symbols = symbols;
+                        document.symbols_version = document.buffer.version();
+                    }
+                }
+            }
+            (RequestKind::Rename, LspResult::Edits(edits)) => self.apply_edits(edits),
+            (RequestKind::Formatting, LspResult::Edits(edits)) => {
+                let edits: Vec<_> = edits
+                    .into_iter()
+                    .map(|(path, edits)| {
+                        let path = if path.as_os_str().is_empty() {
+                            context.path.clone()
+                        } else {
+                            path
+                        };
+                        (path, edits)
+                    })
+                    .collect();
+                self.apply_edits(edits);
+            }
+            (kind, LspResult::Empty) => {
+                tracing::debug!(kind = kind.label(), "empty language server result");
+            }
+            (kind, _) => {
+                tracing::debug!(kind = kind.label(), "unexpected language server result shape");
+            }
+        }
+    }
+
+    /// Open a location and remember where we came from.
+    fn navigate_to(&mut self, location: crate::domain::diagnostics::Location) {
+        if let Some(document) = self.state.active_document() {
+            if let Some(path) = document.path.clone() {
+                self.state
+                    .navigation_history
+                    .push((path, document.buffer.cursor()));
+            }
+        }
+        match self.state.open_file(&location.path) {
+            Ok(id) => {
+                if let Some(document) = self.state.document_mut(id) {
+                    document.goto(location.range.start);
+                }
+            }
+            Err(err) => self.state.error(format!("{err:#}")),
+        }
+    }
+
+    /// Apply workspace edits from rename/formatting, bottom-up per file so
+    /// earlier edits do not shift later ranges.
+    fn apply_edits(&mut self, edits: Vec<(PathBuf, Vec<crate::services::lsp::TextEdit>)>) {
+        let mut changed = 0;
+        for (path, mut file_edits) in edits {
+            if file_edits.is_empty() {
+                continue;
+            }
+            let id = match self.state.document_for_path(&path).map(|d| d.id) {
+                Some(id) => id,
+                None => match self.state.open_file(&path) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        self.state.error(format!("{err:#}"));
+                        continue;
+                    }
+                },
+            };
+            file_edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+            if let Some(document) = self.state.document_mut(id) {
+                for edit in file_edits {
+                    document.buffer.replace_range(edit.range, &edit.new_text);
+                }
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.state
+                .info(format!("applied language server edits to {changed} file(s)"));
+        }
+    }
+
+    /// Tell language servers about open documents and buffer changes.
+    fn sync_open_documents(&mut self, force_open: bool) {
+        let documents: Vec<(PathBuf, crate::services::syntax::LanguageId, String, i64, i64)> = self
+            .state
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let path = document.path.clone()?;
+                Some((
+                    path,
+                    document.language.clone(),
+                    document.buffer.to_text(),
+                    document.buffer.version(),
+                    document.synced_version,
+                ))
+            })
+            .collect();
+
+        for (path, language, text, version, synced) in documents {
+            if synced < 0 || force_open {
+                self.services.lsp.did_open(&path, &language, &text);
+            } else if synced != version {
+                self.services.lsp.did_change(&path, &language, &text);
+            } else {
+                continue;
+            }
+            if let Some(document) = self
+                .state
+                .documents
+                .iter_mut()
+                .find(|d| d.path.as_deref() == Some(path.as_path()))
+            {
+                document.synced_version = version;
+            }
+        }
+    }
+
+    /// Start the server for a language when one is configured.
+    fn ensure_language_server(&mut self, language: &crate::services::syntax::LanguageId) {
+        if !self.services.lsp.auto_start(language) {
+            return;
+        }
+        match self.services.lsp.ensure_started(language) {
+            Ok(name) => {
+                tracing::debug!(server = %name, "language server starting");
+                self.state.lsp_statuses = self.services.lsp.statuses();
+            }
+            Err(err) => {
+                // Only complain once per server.
+                let message = format!("{err:#}");
+                if self.state.lsp_message.as_deref() != Some(message.as_str()) {
+                    self.state.lsp_message = Some(message.clone());
+                    tracing::debug!(error = %message, "language server unavailable");
+                }
+            }
+        }
+    }
+
+    /// Watch the workspace for external edits (agents, other editors, builds).
+    fn start_watcher(&self) -> Option<WorkspaceWatcher> {
+        let sender = self.bus.sender.clone();
+        let ignore = self.state.config.workspace.ignore.clone();
+        match WorkspaceWatcher::start(&self.state.workspace.root, ignore, move |paths| {
+            let _ = sender.send(AppEvent::FileSystem(paths));
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                tracing::warn!(error = %err, "filesystem watching unavailable");
+                None
+            }
+        }
     }
 
     /// Enter the alternate screen, run the loop, and always restore the
@@ -198,13 +487,11 @@ impl App {
                 self.on_filesystem_change(&paths);
                 true
             }
-            AppEvent::Diagnostics {
-                path, diagnostics, ..
-            } => {
-                self.state.set_diagnostics(&path, diagnostics);
+            AppEvent::Lsp(event) => {
+                self.on_lsp_event(*event);
                 true
             }
-            AppEvent::LanguageServer(_) | AppEvent::Debug(_) => true,
+            AppEvent::Debug(_) => true,
             AppEvent::Notice(notice) => {
                 self.state.notify(notice);
                 true
@@ -226,6 +513,16 @@ impl App {
         // Notice files edited underneath us (by an agent, for example).
         for document in &mut self.state.documents {
             document.check_external_change();
+        }
+
+        // Keep language servers in step with the buffers.
+        if let Some(language) = self.state.active_document().map(|d| d.language.clone()) {
+            self.ensure_language_server(&language);
+        }
+        self.sync_open_documents(false);
+        if self.state.lsp_ready != self.services.lsp.any_ready() {
+            self.state.lsp_ready = self.services.lsp.any_ready();
+            self.state.lsp_statuses = self.services.lsp.statuses();
         }
 
         if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
@@ -499,6 +796,7 @@ impl App {
 
     fn shutdown(&mut self) {
         self.save_session();
+        self.services.lsp.shutdown_all();
         if let Ok(mut terminals) = self.state.terminals.lock() {
             terminals.shutdown();
         }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::agent::{AgentKind, AgentState};
 use crate::domain::diagnostics::Position;
 use crate::services::agents::{local::request_from_preset, SpawnAgentRequest};
+use crate::services::lsp::{RequestExtra, RequestKind};
 use crate::services::terminal::SpawnSpec;
 use crate::services::workspace::ScanOptions;
 use crate::services::{fs_ops, git};
@@ -311,8 +312,134 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         "app.quit" => quit(state),
         "workbench.prefix" => state.prefix_active = true,
 
+        // ── language services ─────────────────────────────────────────────
+        "lsp.start" => start_language_server(state, services),
+        "lsp.restart" => restart_language_server(state, services),
+        "lsp.stop" => stop_language_server(state, services),
+        "lsp.hover" => lsp_request(state, services, RequestKind::Hover, RequestExtra::None),
+        "lsp.completion" => {
+            lsp_request(state, services, RequestKind::Completion, RequestExtra::None)
+        }
+        "lsp.definition" => {
+            lsp_request(state, services, RequestKind::Definition, RequestExtra::None)
+        }
+        "lsp.references" => {
+            lsp_request(state, services, RequestKind::References, RequestExtra::None)
+        }
+        "lsp.rename" => match state
+            .active_document()
+            .and_then(|d| d.buffer.word_at(d.buffer.cursor()))
+        {
+            Some(word) => {
+                let position = state
+                    .active_document()
+                    .map(|d| d.buffer.cursor())
+                    .unwrap_or_default();
+                state.prompt("Rename symbol", word, PromptPurpose::RenameSymbol(position));
+            }
+            None => state.warn("place the cursor on a symbol first"),
+        },
+        "lsp.format" => {
+            let extra = RequestExtra::Formatting {
+                tab_size: state.config.editor.tab_width,
+                spaces: state.config.editor.insert_spaces,
+            };
+            lsp_request(state, services, RequestKind::Formatting, extra);
+        }
+        "lsp.back" => match state.navigation_history.pop() {
+            Some((path, position)) => match state.open_file(&path) {
+                Ok(id) => {
+                    if let Some(document) = state.document_mut(id) {
+                        document.goto(position);
+                    }
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            },
+            None => state.info("nowhere to go back to"),
+        },
+
         // ── not yet connected to a running service ────────────────────────
         other => unavailable(state, other),
+    }
+}
+
+// ── language services ─────────────────────────────────────────────────────
+
+fn start_language_server(state: &mut AppState, services: &mut Services) {
+    let Some(language) = state.active_document().map(|d| d.language.clone()) else {
+        state.warn("open a file first");
+        return;
+    };
+    match services.lsp.ensure_started(&language) {
+        Ok(name) => {
+            state.info(format!("starting {name}"));
+            state.lsp_statuses = services.lsp.statuses();
+        }
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+fn restart_language_server(state: &mut AppState, services: &mut Services) {
+    let Some(name) = state
+        .active_document()
+        .and_then(|d| services.lsp.server_for(&d.language))
+    else {
+        state.warn("no language server is configured for this file");
+        return;
+    };
+    match services.lsp.restart(&name) {
+        Ok(()) => {
+            state.info(format!("restarting {name}"));
+            state.problems.retain(|d| d.path != PathBuf::new());
+            state.lsp_statuses = services.lsp.statuses();
+        }
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+fn stop_language_server(state: &mut AppState, services: &mut Services) {
+    let Some(name) = state
+        .active_document()
+        .and_then(|d| services.lsp.server_for(&d.language))
+    else {
+        return;
+    };
+    services.lsp.stop(&name);
+    state.lsp_ready = services.lsp.any_ready();
+    state.lsp_statuses = services.lsp.statuses();
+    // Diagnostics from a stopped server are no longer trustworthy.
+    state.problems.clear();
+    for document in &mut state.documents {
+        document.diagnostics.clear();
+        document.synced_version = -1;
+    }
+    state.info(format!("stopped {name}"));
+}
+
+/// Send a position-based request for the active document.
+fn lsp_request(
+    state: &mut AppState,
+    services: &mut Services,
+    kind: RequestKind,
+    extra: RequestExtra,
+) {
+    let Some(document) = state.active_document() else {
+        state.warn("open a file first");
+        return;
+    };
+    let (Some(path), language, position) = (
+        document.path.clone(),
+        document.language.clone(),
+        document.buffer.cursor(),
+    ) else {
+        state.warn("save this buffer to a file first");
+        return;
+    };
+    if let Err(err) = services
+        .lsp
+        .request(&language, kind, &path, position, extra)
+    {
+        state.warn(format!("{err:#}"));
     }
 }
 
@@ -1010,8 +1137,25 @@ pub fn apply_prompt(
         PromptPurpose::InstallVsix | PromptPurpose::InspectVsix => {
             state.warn("use `termloom extension install <file.vsix>` for now");
         }
-        PromptPurpose::RenameSymbol(_) => {
-            state.warn("no language server is running for this file");
+        PromptPurpose::RenameSymbol(position) => {
+            if value.is_empty() {
+                return;
+            }
+            let Some(document) = state.active_document() else {
+                return;
+            };
+            let (Some(path), language) = (document.path.clone(), document.language.clone()) else {
+                return;
+            };
+            if let Err(err) = services.lsp.request(
+                &language,
+                RequestKind::Rename,
+                &path,
+                position,
+                RequestExtra::NewName(value),
+            ) {
+                state.warn(format!("{err:#}"));
+            }
         }
     }
 }

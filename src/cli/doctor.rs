@@ -269,10 +269,18 @@ pub fn run() -> Result<i32> {
         .count();
     let missing: Vec<&str> = checks
         .iter()
-        .filter(|c| c.status == CheckStatus::Missing)
+        .filter(|c| c.status == CheckStatus::Missing && c.name != "terminal")
         .map(|c| c.name.as_str())
         .collect();
 
+    if checks
+        .iter()
+        .any(|c| c.name == "terminal" && c.status == CheckStatus::Missing)
+    {
+        println!(
+            "this output is not a terminal, so `termloom .` cannot start here; run it from an interactive shell"
+        );
+    }
     if !missing.is_empty() {
         println!(
             "optional integrations not installed: {} — TermLoom works without them",
@@ -301,6 +309,15 @@ mod tests {
                 "missing check {expected}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_terminal_check_is_not_an_optional_integration() {
+        // `doctor` runs piped in CI; that is an environment fact, not a
+        // missing integration the user should install.
+        let checks = collect_checks();
+        let terminal = checks.iter().find(|c| c.name == "terminal").unwrap();
+        assert!(terminal.detail.contains("TERM="), "{}", terminal.detail);
     }
 
     #[test]

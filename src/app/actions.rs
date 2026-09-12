@@ -723,12 +723,18 @@ fn show_snippet_completions(state: &mut AppState) -> bool {
     if items.is_empty() {
         return false;
     }
-    state.completion = Some(crate::app::state::CompletionPopup {
+    let popup = crate::app::state::CompletionPopup {
         items,
         selected: 0,
         position,
         prefix,
-    });
+    };
+    // An empty filtered list would draw an invisible popup that swallows the
+    // next keystrokes; say nothing matched instead.
+    if popup.filtered().is_empty() {
+        return false;
+    }
+    state.completion = Some(popup);
     true
 }
 

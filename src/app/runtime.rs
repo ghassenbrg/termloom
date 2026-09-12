@@ -277,12 +277,19 @@ impl App {
                         .active_document()
                         .and_then(|d| d.buffer.word_at(context.position))
                         .unwrap_or_default();
-                    self.state.completion = Some(crate::app::state::CompletionPopup {
+                    let popup = crate::app::state::CompletionPopup {
                         items,
                         selected: 0,
                         position: context.position,
                         prefix,
-                    });
+                    };
+                    // Never leave an invisible popup capturing keystrokes.
+                    if popup.filtered().is_empty() {
+                        self.state.info("no completions");
+                        self.state.completion = None;
+                    } else {
+                        self.state.completion = Some(popup);
+                    }
                 }
             }
             (RequestKind::Definition, LspResult::Locations(locations)) => {

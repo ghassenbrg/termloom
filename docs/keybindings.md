@@ -88,6 +88,7 @@ List panels share `j`/`k` or the arrow keys to move and `Enter` to act.
 | Explorer | `Enter` open/expand, `Right`/`Left` expand/collapse, `a` new file, `A` new folder, `r` rename, `d` delete, `R` refresh |
 | Git | `Enter` diff, `o` open file, `s` stage, `u` unstage, `x` discard, `R` refresh |
 | Agents | `Enter` focus terminal, `i` send text, `s` stop, `r` restart, `n` rename, `x` remove, `c` new Claude, `t` add task, `Tab` detail tabs |
+| Agent detail | `Tab`/`Right` next tab, `Left`/`Esc` back to the list; in Tasks: `t` add, `j`/`k` select, `Space` tick |
 | Problems / References | `Enter` jump to the location, `Esc` close |
 | Debug | `j`/`k` select a stack frame, `Enter` open its source, `Esc` close |
 | Terminal | every key goes to the child; `Shift+PageUp`/`Shift+PageDown` scroll back |

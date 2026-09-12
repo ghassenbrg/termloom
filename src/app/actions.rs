@@ -306,9 +306,13 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
             Some(id) => state.prompt("New task", "", PromptPurpose::AgentTask(id)),
             None => state.warn("no agent selected"),
         },
-        "agent.task.toggle" => {
-            state.warn("select a task in the Tasks tab with Space");
-        }
+        "agent.task.toggle" => match state.toggle_selected_task() {
+            Some(done) => {
+                state.agent_tab = AgentDetailTab::Tasks;
+                state.info(if done { "task done" } else { "task reopened" });
+            }
+            None => state.info("no task selected — add one with agent.task.add"),
+        },
 
         // ── git ───────────────────────────────────────────────────────────
         "git.refresh" => services.refresh_git(state.git_root()),
@@ -1516,6 +1520,7 @@ pub fn apply_prompt(
             if value.is_empty() {
                 return;
             }
+            state.agent_task_selection = state.agent_tasks.get(&id).map(Vec::len).unwrap_or(0);
             let tasks = state.agent_tasks.entry(id).or_default();
             tasks.push(crate::domain::agent::AgentTask {
                 text: value,

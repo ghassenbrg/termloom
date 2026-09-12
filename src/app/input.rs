@@ -765,15 +765,15 @@ fn handle_agent_detail_key(state: &mut AppState, services: &mut Services, key: K
             true
         }
         KeyCode::Char(' ') if state.agent_tab == AgentDetailTab::Tasks => {
-            // Toggle the first unfinished task; the tasks list is short.
-            if let Some(agent) = state.agents.get_mut(state.agent_selection.selected) {
-                if let Some(task) = agent.tasks.iter_mut().find(|t| !t.done) {
-                    task.done = true;
-                } else if let Some(task) = agent.tasks.last_mut() {
-                    task.done = false;
-                }
-                state.agent_tasks.insert(agent.id, agent.tasks.clone());
-            }
+            actions::execute(state, services, "agent.task.toggle");
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') if state.agent_tab == AgentDetailTab::Tasks => {
+            state.move_task_selection(-1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') if state.agent_tab == AgentDetailTab::Tasks => {
+            state.move_task_selection(1);
             true
         }
         KeyCode::Enter => {
@@ -1459,6 +1459,53 @@ mod tests {
         });
         harness.press(KeyCode::Esc);
         assert!(harness.state().hover.is_none());
+    }
+
+    #[test]
+    fn agent_tasks_can_be_added_selected_and_ticked() {
+        let mut harness = harness();
+        // A local agent so the dashboard has a selection.
+        let request = crate::services::agents::SpawnAgentRequest {
+            kind: crate::domain::agent::AgentKind::Shell,
+            label: "Shell".into(),
+            program: "cat".into(),
+            args: Vec::new(),
+            cwd: harness.fixture.dir.path().to_path_buf(),
+            env: Vec::new(),
+            rows: 10,
+            cols: 40,
+        };
+        crate::app::actions::spawn_agent(
+            &mut harness.fixture.state,
+            &mut harness.services.services,
+            request,
+        );
+        assert_eq!(harness.state().agents.len(), 1);
+
+        harness.state().focus = FocusTarget::AgentList;
+        harness.press(KeyCode::Char('t')); // add a task
+        harness.type_text("write the docs");
+        harness.press(KeyCode::Enter);
+        harness.press(KeyCode::Char('t'));
+        harness.type_text("ship it");
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.state().selected_agent_tasks().len(), 2);
+
+        // Tick the second task from the detail panel.
+        harness.state().focus = FocusTarget::AgentDetail;
+        harness.state().agent_tab = AgentDetailTab::Tasks;
+        harness.state().agent_task_selection = 0;
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::Char(' '));
+        let tasks = harness.state().selected_agent_tasks().to_vec();
+        assert!(!tasks[0].done);
+        assert!(tasks[1].done, "the selected task should be ticked");
+
+        // And untick it again.
+        harness.press(KeyCode::Char(' '));
+        assert!(!harness.state().selected_agent_tasks()[1].done);
+
+        harness.fixture.terminals.lock().unwrap().shutdown();
     }
 
     #[test]

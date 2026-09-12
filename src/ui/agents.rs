@@ -205,7 +205,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let lines = match state.agent_tab {
         AgentDetailTab::Status => status_lines(agent, state, theme),
         AgentDetailTab::Files => files_lines(state, theme),
-        AgentDetailTab::Tasks => task_lines(agent, theme),
+        AgentDetailTab::Tasks => task_lines(agent, state.agent_task_selection, focused, theme),
         AgentDetailTab::Output => output_lines(state, rows[1].width as usize, theme),
     };
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -313,7 +313,12 @@ fn files_lines<'a>(state: &'a AppState, theme: &Theme) -> Vec<Line<'a>> {
     lines
 }
 
-fn task_lines<'a>(agent: &'a AgentSession, theme: &Theme) -> Vec<Line<'a>> {
+fn task_lines<'a>(
+    agent: &'a AgentSession,
+    selected: usize,
+    focused: bool,
+    theme: &Theme,
+) -> Vec<Line<'a>> {
     if agent.tasks.is_empty() {
         return vec![
             Line::from(Span::styled("no tasks yet", theme.dim())),
@@ -327,16 +332,26 @@ fn task_lines<'a>(agent: &'a AgentSession, theme: &Theme) -> Vec<Line<'a>> {
     agent
         .tasks
         .iter()
-        .map(|task| {
+        .enumerate()
+        .map(|(index, task)| {
             let (glyph, style) = if task.done {
                 ("[x]", Style::default().fg(theme.success))
             } else {
                 ("[ ]", Style::default().fg(theme.text))
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{glyph} "), style),
                 Span::styled(task.text.clone(), Style::default().fg(theme.text)),
-            ])
+            ];
+            if index == selected {
+                spans = spans
+                    .into_iter()
+                    .map(|span| {
+                        Span::styled(span.content, span.style.patch(theme.selected_row(focused)))
+                    })
+                    .collect();
+            }
+            Line::from(spans)
         })
         .collect()
 }

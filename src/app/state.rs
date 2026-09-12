@@ -373,6 +373,8 @@ pub struct AppState {
     /// User-authored checklists outlive backend refreshes. Backends report
     /// process state; they do not own this local UI data.
     pub agent_tasks: HashMap<AgentId, Vec<AgentTask>>,
+    /// Row selected in the agent detail Tasks tab.
+    pub agent_task_selection: usize,
     pub agent_selection: ListSelection,
     pub agent_tab: AgentDetailTab,
     /// Cached output lines for the selected agent's detail panel.
@@ -406,6 +408,8 @@ pub struct AppState {
     // ── overlays ──────────────────────────────────────────────────────────
     pub palette: Option<PaletteState>,
     pub modal: Option<Modal>,
+    /// Focus to restore when an overlay closes.
+    modal_return: Option<FocusTarget>,
     pub toasts: Vec<Toast>,
     pub help_visible: bool,
 
@@ -464,6 +468,7 @@ impl AppState {
             terminal_view_offset: 0,
             agents: Vec::new(),
             agent_tasks: HashMap::new(),
+            agent_task_selection: 0,
             agent_selection: ListSelection::default(),
             agent_tab: AgentDetailTab::Status,
             agent_output: Vec::new(),
@@ -484,6 +489,7 @@ impl AppState {
             lsp_message: None,
             palette: None,
             modal: None,
+            modal_return: None,
             toasts: Vec::new(),
             help_visible: false,
             focus: FocusTarget::Explorer,
@@ -731,6 +737,42 @@ impl AppState {
         self.selected_agent().map(|a| a.id)
     }
 
+    /// Checklist of the selected agent.
+    pub fn selected_agent_tasks(&self) -> &[AgentTask] {
+        self.selected_agent()
+            .and_then(|agent| self.agent_tasks.get(&agent.id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Move the task selection, clamped to the list.
+    pub fn move_task_selection(&mut self, delta: isize) {
+        let len = self.selected_agent_tasks().len();
+        if len == 0 {
+            self.agent_task_selection = 0;
+            return;
+        }
+        let next = self.agent_task_selection as isize + delta;
+        self.agent_task_selection = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Tick or untick the selected task. Returns its new state.
+    pub fn toggle_selected_task(&mut self) -> Option<bool> {
+        let id = self.selected_agent_id()?;
+        let index = self.agent_task_selection;
+        let tasks = self.agent_tasks.get_mut(&id)?;
+        let task = tasks.get_mut(index)?;
+        task.done = !task.done;
+        let done = task.done;
+        // Keep the copy the dashboard renders in step.
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+            if let Some(agent_task) = agent.tasks.get_mut(index) {
+                agent_task.done = done;
+            }
+        }
+        Some(done)
+    }
+
     /// Agents that want the user's attention.
     pub fn agents_needing_attention(&self) -> usize {
         self.agents
@@ -887,6 +929,7 @@ impl AppState {
     // ── palette ───────────────────────────────────────────────────────────
 
     pub fn open_palette(&mut self, mode: PaletteMode) {
+        self.remember_focus();
         let mut palette = PaletteState::new(mode);
         self.refresh_palette_items(&mut palette);
         self.palette = Some(palette);
@@ -895,10 +938,28 @@ impl AppState {
 
     pub fn close_palette(&mut self) {
         self.palette = None;
-        self.focus = match self.active_tab {
+        self.restore_focus();
+    }
+
+    /// Remember where focus was before an overlay took it.
+    fn remember_focus(&mut self) {
+        if !matches!(self.focus, FocusTarget::Modal | FocusTarget::CommandPalette) {
+            self.modal_return = Some(self.focus);
+        }
+    }
+
+    /// Put focus back where the overlay found it.
+    fn restore_focus(&mut self) {
+        let restored = self.modal_return.take().filter(|target| match target {
+            // A tab may have been closed while the dialog was open.
+            FocusTarget::Editor(id) => self.documents.iter().any(|d| d.id == *id),
+            FocusTarget::Terminal(id) => self.terminal_ids().contains(id),
+            _ => true,
+        });
+        self.focus = restored.unwrap_or(match self.active_tab {
             Some(id) => FocusTarget::Editor(id),
             None => FocusTarget::Explorer,
-        };
+        });
     }
 
     /// Recompute palette results for the current query.
@@ -963,6 +1024,7 @@ impl AppState {
         message: impl Into<String>,
         action: ConfirmAction,
     ) {
+        self.remember_focus();
         self.modal = Some(Modal::Confirm {
             title: title.into(),
             message: message.into(),
@@ -977,6 +1039,7 @@ impl AppState {
         value: impl Into<String>,
         purpose: PromptPurpose,
     ) {
+        self.remember_focus();
         self.modal = Some(Modal::Prompt {
             title: title.into(),
             value: value.into(),
@@ -992,6 +1055,7 @@ impl AppState {
         options: Vec<String>,
         purpose: SelectPurpose,
     ) {
+        self.remember_focus();
         self.modal = Some(Modal::Select {
             title: title.into(),
             options,
@@ -1002,6 +1066,7 @@ impl AppState {
     }
 
     pub fn show_message(&mut self, title: impl Into<String>, body: Vec<String>) {
+        self.remember_focus();
         self.modal = Some(Modal::Message {
             title: title.into(),
             body,
@@ -1009,13 +1074,10 @@ impl AppState {
         self.focus = FocusTarget::Modal;
     }
 
-    /// Dismiss the modal and restore a sensible focus.
+    /// Dismiss the modal and restore the focus it interrupted.
     pub fn close_modal(&mut self) {
         self.modal = None;
-        self.focus = match self.active_tab {
-            Some(id) => FocusTarget::Editor(id),
-            None => FocusTarget::Explorer,
-        };
+        self.restore_focus();
     }
 
     // ── explorer ──────────────────────────────────────────────────────────

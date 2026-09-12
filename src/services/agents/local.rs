@@ -390,6 +390,23 @@ mod tests {
     }
 
     #[test]
+    fn a_live_agent_leaves_the_starting_state() {
+        // Regression: the dashboard used to show every running agent as
+        // "Starting" because the initial reading was never replaced.
+        let (backend, _terminals, _rx) = backend();
+        let session = block(backend.spawn_agent(request("cat", &[]))).unwrap();
+        assert!(wait_until(|| {
+            block(backend.refresh()).unwrap();
+            let state = block(backend.list_agents()).unwrap()[0].state;
+            state != AgentState::Starting
+        }));
+        let agents = block(backend.list_agents()).unwrap();
+        assert!(agents[0].state.is_live(), "{:?}", agents[0].state);
+        assert_ne!(agents[0].state, AgentState::Starting);
+        block(backend.stop(session.id)).unwrap();
+    }
+
+    #[test]
     fn refresh_maps_a_failing_process_to_failed() {
         let (backend, _terminals, _rx) = backend();
         block(backend.spawn_agent(request("false", &[]))).unwrap();

@@ -22,7 +22,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let (errors, warnings) = state.problem_counts();
     let block = panel_with_hint(
         "PROBLEMS",
-        format!("{errors} errors · {warnings} warnings"),
+        format!(
+            "{errors} {} · {warnings} {}",
+            plural(errors, "error"),
+            plural(warnings, "warning")
+        ),
         focused,
         theme,
     );
@@ -141,4 +145,25 @@ fn draw_references(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `1 error` but `2 errors`.
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plural;
+
+    #[test]
+    fn counts_read_naturally() {
+        assert_eq!(plural(0, "error"), "errors");
+        assert_eq!(plural(1, "error"), "error");
+        assert_eq!(plural(2, "warning"), "warnings");
+    }
 }

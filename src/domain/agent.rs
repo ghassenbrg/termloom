@@ -223,22 +223,24 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
-    /// Apply an observation, keeping the higher-confidence reading when two
-    /// sources disagree within the same refresh.
+    /// Apply a fresh observation.
+    ///
+    /// Every observation describes the session *now*, so the newest one wins
+    /// and `confidence` is recorded as provenance for the UI rather than used
+    /// as a ratchet — an early high-confidence `Starting` must not freeze the
+    /// dashboard for the rest of the session. The one hard rule is that a
+    /// process which has finished never goes back to a live state.
     pub fn apply(&mut self, obs: AgentStateObservation) {
-        let terminal = matches!(
+        let finished = matches!(
             self.state,
             AgentState::Done | AgentState::Failed | AgentState::Exited
         );
-        // A finished process never goes back to a live state.
-        if terminal && obs.state.is_live() {
+        if finished && obs.state.is_live() {
             return;
         }
-        if obs.source == ObservationSource::Process || obs.confidence >= self.confidence {
-            self.state = obs.state;
-            self.state_source = obs.source;
-            self.confidence = obs.confidence;
-        }
+        self.state = obs.state;
+        self.state_source = obs.source;
+        self.confidence = obs.confidence;
     }
 }
 
@@ -311,7 +313,9 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_does_not_override_high_confidence() {
+    fn a_newer_reading_replaces_an_older_one() {
+        // Observations describe the present, so the latest wins even when it
+        // is less certain; its provenance travels with it.
         let mut session = sample();
         session.apply(AgentStateObservation::new(
             AgentState::WaitingForInput,
@@ -323,7 +327,26 @@ mod tests {
             ObservationSource::OutputActivity,
             0.3,
         ));
-        assert_eq!(session.state, AgentState::WaitingForInput);
+        assert_eq!(session.state, AgentState::Idle);
+        assert_eq!(session.state_source, ObservationSource::OutputActivity);
+        assert_eq!(session.confidence, 0.3);
+    }
+
+    #[test]
+    fn a_starting_session_leaves_that_state_once_it_is_observed() {
+        // Regression: a high-confidence `Starting` used to block every later
+        // heuristic, so live agents stayed "Starting" forever.
+        let mut session = sample();
+        session.state = AgentState::Starting;
+        session.state_source = ObservationSource::Process;
+        session.confidence = 0.9;
+
+        session.apply(AgentStateObservation::new(
+            AgentState::Working,
+            ObservationSource::OutputActivity,
+            0.7,
+        ));
+        assert_eq!(session.state, AgentState::Working);
     }
 
     #[test]

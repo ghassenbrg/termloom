@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use crate::domain::agent::{AgentBackendKind, AgentKind, AgentSession};
 use crate::domain::ids::AgentId;
 
+pub use herdr::HerdrAgentBackend;
 pub use local::LocalAgentBackend;
 
 /// What to launch.

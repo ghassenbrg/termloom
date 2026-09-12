@@ -42,7 +42,19 @@ impl KeyChord {
                 _ => return None,
             }
         }
-        let code = parse_code(last.trim())?;
+        let mut code = parse_code(last.trim())?;
+        // A terminal reports Shift+S as the character `S`, so fold an
+        // explicit `shift+` on a letter into the letter itself. Without this
+        // `shift+s` and `s` would be the same chord and one of them could
+        // never fire.
+        if mods.contains(KeyModifiers::SHIFT) {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    code = KeyCode::Char(c.to_ascii_uppercase());
+                    mods.remove(KeyModifiers::SHIFT);
+                }
+            }
+        }
         Some(KeyChord::new(code, mods))
     }
 
@@ -69,6 +81,8 @@ impl fmt::Display for KeyChord {
         }
         match self.code {
             KeyCode::Char(' ') => write!(f, "Space"),
+            // An uppercase letter is what a terminal sends for Shift+letter.
+            KeyCode::Char(c) if c.is_ascii_uppercase() => write!(f, "Shift+{c}"),
             KeyCode::Char(c) => write!(f, "{}", c.to_ascii_uppercase()),
             KeyCode::F(n) => write!(f, "F{n}"),
             KeyCode::Enter => write!(f, "Enter"),
@@ -127,12 +141,13 @@ fn parse_code(name: &str) -> Option<KeyCode> {
                     }
                 }
             }
+            // Case is significant: `s` and `S` are different chords.
             let mut chars = name.chars();
             let c = chars.next()?;
             if chars.next().is_some() {
                 return None;
             }
-            KeyCode::Char(c.to_ascii_lowercase())
+            KeyCode::Char(c)
         }
     };
     Some(code)
@@ -184,10 +199,10 @@ pub const DEFAULT_BINDINGS: &[(&str, &str, Scope)] = &[
     ("p", "palette.commands", Scope::Prefix),
     ("w", "editor.close_tab", Scope::Prefix),
     ("s", "file.save", Scope::Prefix),
-    ("shift+s", "file.save_all", Scope::Prefix),
+    ("S", "file.save_all", Scope::Prefix),
     ("b", "view.toggle.explorer", Scope::Prefix),
-    ("shift+a", "view.toggle.agents", Scope::Prefix),
-    ("shift+t", "view.toggle.terminals", Scope::Prefix),
+    ("A", "view.toggle.agents", Scope::Prefix),
+    ("T", "view.toggle.terminals", Scope::Prefix),
     ("m", "view.toggle.problems", Scope::Prefix),
     ("v", "view.toggle.debug", Scope::Prefix),
     ("k", "terminal.kill", Scope::Prefix),
@@ -375,11 +390,88 @@ mod tests {
     }
 
     #[test]
+    fn no_two_default_bindings_share_a_chord_in_one_scope() {
+        // A duplicate would make the second command permanently unreachable.
+        let map = Keymap::default();
+        let mut seen: Vec<(Scope, KeyChord, &str)> = Vec::new();
+        for binding in map.all() {
+            if let Some((_, _, other)) = seen
+                .iter()
+                .find(|(scope, chord, _)| *scope == binding.scope && *chord == binding.chord)
+            {
+                panic!(
+                    "{} and {} both answer to {} in {:?} scope",
+                    other, binding.command, binding.chord, binding.scope
+                );
+            }
+            seen.push((binding.scope, binding.chord, &binding.command));
+        }
+    }
+
+    #[test]
+    fn shifted_letters_are_distinct_chords() {
+        let lower = KeyChord::parse("s").unwrap();
+        let upper = KeyChord::parse("S").unwrap();
+        assert_ne!(lower, upper, "`s` and `S` must be different chords");
+        assert_eq!(KeyChord::parse("shift+s").unwrap(), upper);
+
+        // A terminal sends the uppercase character plus a shift modifier.
+        let event = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        assert!(upper.matches(&event));
+        assert!(!lower.matches(&event));
+        assert_eq!(upper.to_string(), "Shift+S");
+        assert_eq!(lower.to_string(), "S");
+    }
+
+    #[test]
+    fn shifted_prefix_bindings_reach_their_own_commands() {
+        let map = Keymap::default();
+        let shifted = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        let plain = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(map.resolve(Scope::Prefix, &shifted), Some("file.save_all"));
+        assert_eq!(map.resolve(Scope::Prefix, &plain), Some("file.save"));
+
+        let toggle = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(
+            map.resolve(Scope::Prefix, &toggle),
+            Some("view.toggle.agents")
+        );
+    }
+
+    #[test]
     fn every_default_binding_parses() {
         for (chord, command, _) in DEFAULT_BINDINGS {
             assert!(
                 KeyChord::parse(chord).is_some(),
                 "chord {chord} for {command} does not parse"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod documentation {
+    use super::*;
+
+    /// The keybinding reference is written by hand; this keeps it honest.
+    #[test]
+    fn the_documented_table_matches_the_defaults() {
+        let doc = include_str!("../../docs/keybindings.md");
+        let map = Keymap::default();
+        for binding in map.all() {
+            assert!(
+                doc.contains(&format!("`{}`", binding.command)),
+                "docs/keybindings.md does not mention the command {}",
+                binding.command
+            );
+            let chord = match binding.scope {
+                Scope::Prefix => format!("{} {}", map.prefix, binding.chord),
+                _ => binding.chord.to_string(),
+            };
+            assert!(
+                doc.contains(&chord),
+                "docs/keybindings.md does not document the chord {chord} for {}",
+                binding.command
             );
         }
     }

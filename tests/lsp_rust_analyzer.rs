@@ -261,8 +261,11 @@ fn wait_for_symbols(client: &LspClient, collector: &Collector, path: &Path) {
 }
 
 #[test]
-fn a_crashing_server_is_reported_and_does_not_hang() {
-    // `cat` speaks no LSP: it exits at EOF and must be reported as a crash.
+fn a_server_that_dies_immediately_is_reported_either_way() {
+    // `false` exits at once. Whether the initialize write lands before the
+    // process is gone is a race the workbench cannot control, so both
+    // outcomes are legitimate — what matters is that each one reports a
+    // reason the user can act on, and that neither hangs.
     let (tx, rx) = mpsc::channel();
     let sink: LspSink = Arc::new(move |event| {
         let _ = tx.send(event);
@@ -272,17 +275,31 @@ fn a_crashing_server_is_reported_and_does_not_hang() {
         languages: vec!["rust".into()],
         ..Default::default()
     };
-    let _client = LspClient::start("broken", &config, Path::new("."), sink).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut saw_exit = false;
-    while Instant::now() < deadline && !saw_exit {
-        if let Ok(LspEvent::Exited { crashed, .. }) = rx.recv_timeout(Duration::from_secs(5)) {
-            assert!(crashed, "an unexpected exit is a crash");
-            saw_exit = true;
+    match LspClient::start("broken", &config, Path::new("."), sink) {
+        // Lost the race: the write failed, and the error names the command.
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("false"),
+                "the failure should name the command: {message}"
+            );
+        }
+        // Won the race: the reader thread must report the crash promptly.
+        Ok(_client) => {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut saw_exit = false;
+            while Instant::now() < deadline && !saw_exit {
+                if let Ok(LspEvent::Exited { crashed, .. }) =
+                    rx.recv_timeout(Duration::from_secs(5))
+                {
+                    assert!(crashed, "an unexpected exit is a crash");
+                    saw_exit = true;
+                }
+            }
+            assert!(saw_exit, "a dead server must report its exit");
         }
     }
-    assert!(saw_exit, "a dead server must report its exit");
 }
 
 /// Regression: the workbench ticks while a server is still starting, and a

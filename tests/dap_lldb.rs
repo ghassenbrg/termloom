@@ -246,3 +246,43 @@ fn a_missing_adapter_is_reported_without_panicking() {
     let sink: DebugSink = Arc::new(|_| {});
     assert!(DebugSession::start(config, sink).is_err());
 }
+
+#[test]
+fn an_adapter_that_dies_immediately_names_itself_in_the_error() {
+    // `false` exits at once, so the handshake cannot complete. The failure
+    // must name the adapter rather than surfacing a raw io error.
+    let config = DebugLaunchConfig {
+        name: "probe".into(),
+        type_name: "none".into(),
+        attach: false,
+        adapter_command: "false".into(),
+        adapter_args: Vec::new(),
+        adapter_env: Vec::new(),
+        cwd: std::env::temp_dir(),
+        arguments: serde_json::json!({}),
+        breakpoints: HashMap::new(),
+    };
+    let (tx, rx) = mpsc::channel();
+    let sink: DebugSink = Arc::new(move |event| {
+        let _ = tx.send(event);
+    });
+    let session = DebugSession::start(config, sink).expect("spawning `false` succeeds");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut reason = None;
+    while Instant::now() < deadline && reason.is_none() {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(DebugEvent::Failed { message, .. }) => reason = Some(message),
+            // A clean terminate without a reason would leave the user in the
+            // dark, so keep waiting for the explanation.
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let reason = reason.expect("a dead adapter must explain itself");
+    assert!(
+        reason.contains("false"),
+        "the failure should name the adapter: {reason}"
+    );
+    session.send(DebugCommand::Stop).ok();
+}

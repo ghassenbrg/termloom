@@ -217,7 +217,14 @@ impl LspClient {
             .map(toml_to_json)
             .filter(|value| !value.is_null());
         let params = protocol::initialize_params(root, options);
-        client.send_request_raw(0, "initialize", params)?;
+        // A server that dies immediately (a wrong command, a missing runtime)
+        // makes this first write fail with a bare "broken pipe"; say what
+        // actually happened instead.
+        client
+            .send_request_raw(0, "initialize", params)
+            .with_context(|| {
+                format!("`{}` exited before it could be initialised", config.command)
+            })?;
         Ok(client)
     }
 

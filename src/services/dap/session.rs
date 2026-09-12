@@ -164,6 +164,8 @@ struct Driver {
     scope_queue: std::collections::VecDeque<(String, i64)>,
     breakpoints: HashMap<PathBuf, Vec<usize>>,
     launched: bool,
+    /// Set once the adapter answered `initialize`.
+    initialised: bool,
     /// Reason reported by the last `stopped` event.
     last_stop_reason: String,
     session_id: u64,
@@ -192,6 +194,7 @@ impl Driver {
             variables: Vec::new(),
             scope_queue: std::collections::VecDeque::new(),
             launched: false,
+            initialised: false,
             session_id,
             ended: false,
         }
@@ -203,9 +206,15 @@ impl Driver {
             protocol::initialize_arguments(),
             Pending::Initialize,
         ) {
+            // An adapter that died on startup makes this write fail with a
+            // bare "broken pipe"; name the adapter instead.
+            tracing::debug!(error = %err, "debug adapter initialize failed");
             self.emit(DebugEvent::Failed {
                 session_id: self.session_id,
-                message: format!("{err:#}"),
+                message: format!(
+                    "`{}` exited before the debug session could start",
+                    self.config.adapter_command
+                ),
                 fatal: true,
             });
             self.emit(DebugEvent::Terminated {
@@ -224,16 +233,8 @@ impl Driver {
                     }
                     continue;
                 }
-                Ok(AdapterMessage::Disconnected) => {
-                    self.emit(DebugEvent::Terminated {
-                        session_id: self.session_id,
-                    });
-                    return;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.emit(DebugEvent::Terminated {
-                        session_id: self.session_id,
-                    });
+                Ok(AdapterMessage::Disconnected) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.finish_disconnected();
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -259,6 +260,25 @@ impl Driver {
             // Nothing to do: wait briefly for either source.
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// The adapter's pipe closed. A disconnect before the handshake finished
+    /// is a broken adapter, not a finished debug session, and saying only
+    /// "terminated" would leave the user guessing.
+    fn finish_disconnected(&mut self) {
+        if !self.initialised || !self.launched {
+            self.emit(DebugEvent::Failed {
+                session_id: self.session_id,
+                message: format!(
+                    "`{}` exited before the debug session could start",
+                    self.config.adapter_command
+                ),
+                fatal: true,
+            });
+        }
+        self.emit(DebugEvent::Terminated {
+            session_id: self.session_id,
+        });
     }
 
     fn send(&mut self, command: &str, arguments: Value, pending: Pending) -> Result<()> {
@@ -385,6 +405,7 @@ impl Driver {
 
         match pending {
             Pending::Initialize => {
+                self.initialised = true;
                 self.capabilities = protocol::parse_capabilities(&body);
                 self.emit(DebugEvent::Initialized {
                     adapter: self.config.adapter_command.clone(),

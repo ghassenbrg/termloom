@@ -65,6 +65,8 @@ impl Fixture {
 
 /// A running TermLoom under our own pty, with its screen parsed by vt100.
 struct Harness {
+    /// Kept so the test can resize the pty the way a window manager would.
+    master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -102,7 +104,12 @@ impl Harness {
 
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(40, 150, 2000)));
+        let parser_size = (40u16, 150u16);
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            parser_size.0,
+            parser_size.1,
+            2000,
+        )));
 
         let sink = Arc::clone(&parser);
         std::thread::spawn(move || {
@@ -116,6 +123,7 @@ impl Harness {
         });
 
         Harness {
+            master: pair.master,
             writer,
             parser,
             child,
@@ -124,6 +132,19 @@ impl Harness {
 
     fn screen(&self) -> String {
         self.parser.lock().unwrap().screen().contents()
+    }
+
+    /// Resize the pty and the local screen model together.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        self.parser.lock().unwrap().set_size(rows, cols);
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -310,6 +331,46 @@ fn shows_and_stages_a_git_change() {
     assert!(
         app.wait_for(" M notes.txt"),
         "unstaging should return it to the worktree:\n{}",
+        app.screen()
+    );
+
+    app.send(b"\x11");
+    assert!(app.wait_exit(), "{}", app.screen());
+}
+
+#[test]
+fn survives_repeated_resizes_down_to_a_tiny_terminal() {
+    let fixture = Fixture::new();
+    let mut app = fixture.start();
+    assert!(app.wait_for("EXPLORER"), "{}", app.screen());
+
+    // Open a file so every panel has content to lay out.
+    app.send(b"\x1b[B");
+    app.send(b"\r");
+    assert!(app.wait_for("# demo"), "{}", app.screen());
+
+    // Walk through wide, compact, minimal and back, several times.
+    for _ in 0..3 {
+        for (rows, cols) in [(40, 150), (24, 100), (12, 60), (8, 30), (44, 170)] {
+            app.resize(rows, cols);
+            std::thread::sleep(Duration::from_millis(180));
+        }
+    }
+
+    // The workbench is still alive and drawing at the final size.
+    assert!(
+        app.wait_for("TermLoom"),
+        "the workbench should still render after resizing:\n{}",
+        app.screen()
+    );
+    assert!(app.wait_for("EXPLORER"), "{}", app.screen());
+
+    // And it still responds to input.
+    app.send(b"\x00");
+    app.send(b"t");
+    assert!(
+        app.wait_for("Terminal 1"),
+        "input should still work after resizing:\n{}",
         app.screen()
     );
 

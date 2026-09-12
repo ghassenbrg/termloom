@@ -104,6 +104,11 @@ fn rules_for(language: &LanguageId) -> Option<Rules> {
     })
 }
 
+/// Whether outline extraction is available for a language.
+pub fn supports(language: &LanguageId) -> bool {
+    rules_for(language).is_some()
+}
+
 /// Extracts a flat, depth-annotated symbol list from a document.
 #[derive(Default)]
 pub struct OutlineExtractor {

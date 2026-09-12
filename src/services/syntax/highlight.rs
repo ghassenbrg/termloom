@@ -174,6 +174,7 @@ pub struct Highlighter {
     pub max_bytes: usize,
 }
 
+#[derive(Debug)]
 struct CompiledGrammar {
     language: Language,
     query: Query,

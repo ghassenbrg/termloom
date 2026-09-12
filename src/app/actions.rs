@@ -1,0 +1,1057 @@
+//! Command execution.
+//!
+//! Every command id from [`super::commands`] is handled here. Keeping them in
+//! one place means a keybinding, a palette entry and a mouse click all run the
+//! same code path.
+
+use std::path::{Path, PathBuf};
+
+use crate::domain::agent::{AgentKind, AgentState};
+use crate::domain::diagnostics::Position;
+use crate::services::agents::{local::request_from_preset, SpawnAgentRequest};
+use crate::services::terminal::SpawnSpec;
+use crate::services::workspace::ScanOptions;
+use crate::services::{fs_ops, git};
+
+use super::events::Notice;
+use super::focus::{Direction, FocusTarget};
+use super::services::Services;
+use super::state::{AgentDetailTab, AppState, ConfirmAction, PaletteMode, PromptPurpose};
+
+/// Run a command by id. Unknown ids are reported rather than ignored.
+pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
+    match id {
+        // ── file ──────────────────────────────────────────────────────────
+        "file.save" => save_active(state, false),
+        "file.save_all" => save_all(state),
+        "file.reload" => reload_active(state),
+        "file.new" => {
+            let dir = state.explorer_target_dir();
+            state.prompt("New file", "", PromptPurpose::NewFile(dir));
+        }
+        "file.new_folder" => {
+            let dir = state.explorer_target_dir();
+            state.prompt("New folder", "", PromptPurpose::NewFolder(dir));
+        }
+        "file.rename" => match state.explorer_selection() {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                state.prompt("Rename", name, PromptPurpose::Rename(path));
+            }
+            None => state.warn("select something in the explorer first"),
+        },
+        "file.delete" => match state.explorer_selection() {
+            Some(path) => state.confirm(
+                "Delete",
+                format!("Delete {}? This cannot be undone.", path.display()),
+                ConfirmAction::DeletePath(path),
+            ),
+            None => state.warn("select something in the explorer first"),
+        },
+        "file.reveal" => {
+            if let Some(path) = state.active_document().and_then(|d| d.path.clone()) {
+                state.reveal_in_explorer(&path);
+                state.focus = FocusTarget::Explorer;
+            }
+        }
+
+        // ── editor ────────────────────────────────────────────────────────
+        "editor.close_tab" => close_active_tab(state),
+        "editor.close_others" => {
+            let keep = state.active_tab;
+            let ids: Vec<_> = state
+                .documents
+                .iter()
+                .filter(|d| Some(d.id) != keep && !d.is_dirty())
+                .map(|d| d.id)
+                .collect();
+            for id in ids {
+                state.close_tab(id, false);
+            }
+        }
+        "editor.next_tab" => state.next_tab(1),
+        "editor.prev_tab" => state.next_tab(-1),
+        "editor.reopen_tab" => {
+            if let Some(path) = state.recently_closed.pop_back() {
+                if let Err(err) = state.open_file(&path) {
+                    state.error(format!("{err:#}"));
+                }
+            } else {
+                state.info("no recently closed files");
+            }
+        }
+        "editor.undo" => {
+            if let Some(document) = state.active_document_mut() {
+                if !document.buffer.undo() {
+                    state.info("nothing to undo");
+                }
+            }
+        }
+        "editor.redo" => {
+            if let Some(document) = state.active_document_mut() {
+                if !document.buffer.redo() {
+                    state.info("nothing to redo");
+                }
+            }
+        }
+        "editor.find" => {
+            let seed = state
+                .active_document()
+                .and_then(|d| d.buffer.selected_text())
+                .or_else(|| {
+                    state
+                        .active_document()
+                        .and_then(|d| d.buffer.word_at(d.buffer.cursor()))
+                })
+                .unwrap_or_default();
+            state.prompt("Find", seed, PromptPurpose::FindInFile);
+        }
+        "editor.find_next" => find_step(state, true),
+        "editor.find_prev" => find_step(state, false),
+        "editor.goto_line" => state.prompt("Go to line", "", PromptPurpose::GotoLine),
+        "editor.copy" => copy_selection(state, false),
+        "editor.cut" => copy_selection(state, true),
+        "editor.paste" => paste(state),
+        "editor.select_all" => {
+            if let Some(document) = state.active_document_mut() {
+                document.buffer.select_all();
+            }
+        }
+        "editor.toggle_comment" => toggle_comment(state),
+
+        // ── view ──────────────────────────────────────────────────────────
+        "view.toggle.explorer" => state.layout.explorer = !state.layout.explorer,
+        "view.toggle.outline" => state.layout.outline = !state.layout.outline,
+        "view.toggle.git" => state.layout.git = !state.layout.git,
+        "view.toggle.agents" => state.layout.agents = !state.layout.agents,
+        "view.toggle.terminals" => state.layout.terminals = !state.layout.terminals,
+        "view.toggle.problems" => {
+            state.layout.problems = !state.layout.problems;
+            if state.layout.problems {
+                state.focus = FocusTarget::Problems;
+            }
+        }
+        "view.toggle.debug" => {
+            state.layout.debug = !state.layout.debug;
+            if state.layout.debug {
+                state.focus = FocusTarget::Debug;
+            }
+        }
+        "view.toggle.extensions" | "extensions.list" => {
+            state.layout.extensions = !state.layout.extensions;
+        }
+        "view.focus.explorer" => {
+            state.layout.explorer = true;
+            state.focus = FocusTarget::Explorer;
+        }
+        "view.focus.outline" => {
+            state.layout.outline = true;
+            state.focus = FocusTarget::Outline;
+        }
+        "view.focus.git" => {
+            state.layout.git = true;
+            state.focus = FocusTarget::Git;
+        }
+        "view.focus.agents" => {
+            state.layout.agents = true;
+            state.focus = FocusTarget::AgentList;
+        }
+        "view.focus.editor" => {
+            if let Some(id) = state.active_tab {
+                state.focus = FocusTarget::Editor(id);
+            }
+        }
+        "view.focus.terminal" => {
+            if let Some(id) = state
+                .focused_terminal
+                .or(state.terminal_ids().first().copied())
+            {
+                state.focus_terminal(id);
+            }
+        }
+        "focus.left" => state.move_focus(Direction::Left),
+        "focus.right" => state.move_focus(Direction::Right),
+        "focus.up" => state.move_focus(Direction::Up),
+        "focus.down" => state.move_focus(Direction::Down),
+
+        // ── terminals ─────────────────────────────────────────────────────
+        "terminal.new" => new_terminal(state),
+        "terminal.next" => state.cycle_terminal(1),
+        "terminal.prev" => state.cycle_terminal(-1),
+        "terminal.kill" => with_focused_terminal(state, |session| {
+            let _ = session.kill();
+        }),
+        "terminal.restart" => restart_terminal(state),
+        "terminal.close" => {
+            if let Some(id) = state.focused_terminal {
+                if let Ok(mut terminals) = state.terminals.lock() {
+                    terminals.close(id);
+                }
+                state.reconcile_terminal_focus();
+            }
+        }
+        "terminal.clear_scroll" => with_focused_terminal(state, |session| {
+            session.set_scroll_offset(0);
+        }),
+
+        // ── agents ────────────────────────────────────────────────────────
+        "agent.new.claude" => spawn_preset(state, services, "claude"),
+        "agent.new.codex" => spawn_preset(state, services, "codex"),
+        "agent.new.shell" => spawn_shell_agent(state, services),
+        "agent.new.custom" => state.prompt(
+            "Run command as agent",
+            "",
+            PromptPurpose::CustomAgentCommand,
+        ),
+        "agent.focus_terminal" => {
+            if let Some(id) = state.selected_agent().and_then(|a| a.terminal_id) {
+                state.focus_terminal(id);
+            } else {
+                state.warn("this agent has no terminal");
+            }
+        }
+        "agent.send_input" => match state.selected_agent_id() {
+            Some(id) => state.prompt("Send to agent", "", PromptPurpose::AgentInput(id)),
+            None => state.warn("no agent selected"),
+        },
+        "agent.stop" => match state.selected_agent() {
+            Some(agent) => {
+                let (id, label) = (agent.id, agent.label.clone());
+                state.confirm(
+                    "Stop agent",
+                    format!("Stop {label}? The process will be terminated."),
+                    ConfirmAction::StopAgent(id),
+                );
+            }
+            None => state.warn("no agent selected"),
+        },
+        "agent.restart" => {
+            if let Some(id) = state.selected_agent_id() {
+                let registry = &services.agents;
+                let result = services.runtime.block_on(async {
+                    match registry.owner(id).await {
+                        Some(backend) => backend.restart(id).await.map(|_| ()),
+                        None => Err(anyhow::anyhow!("no backend owns this agent")),
+                    }
+                });
+                match result {
+                    Ok(()) => state.info("agent restarted"),
+                    Err(err) => state.error(format!("restart failed: {err:#}")),
+                }
+                refresh_agents(state, services);
+            }
+        }
+        "agent.rename" => match state.selected_agent() {
+            Some(agent) => {
+                let (id, label) = (agent.id, agent.label.clone());
+                state.prompt("Rename agent", label, PromptPurpose::AgentRename(id));
+            }
+            None => state.warn("no agent selected"),
+        },
+        "agent.remove" => {
+            if let Some(id) = state.selected_agent_id() {
+                let registry = &services.agents;
+                let _ = services.runtime.block_on(async {
+                    match registry.owner(id).await {
+                        Some(backend) => backend.remove(id).await,
+                        None => Ok(()),
+                    }
+                });
+                refresh_agents(state, services);
+                state.agent_selection.clamp(state.agents.len());
+                state.reconcile_terminal_focus();
+            }
+        }
+        "agent.task.add" => match state.selected_agent_id() {
+            Some(id) => state.prompt("New task", "", PromptPurpose::AgentTask(id)),
+            None => state.warn("no agent selected"),
+        },
+        "agent.task.toggle" => {
+            state.warn("select a task in the Tasks tab with Space");
+        }
+
+        // ── git ───────────────────────────────────────────────────────────
+        "git.refresh" => services.refresh_git(state.git_root()),
+        "git.stage" => git_operation(state, services, "stage"),
+        "git.unstage" => git_operation(state, services, "unstage"),
+        "git.stage_all" => git_operation(state, services, "stage_all"),
+        "git.unstage_all" => git_operation(state, services, "unstage_all"),
+        "git.discard" => match state.selected_git_path() {
+            Some(path) => state.confirm(
+                "Discard changes",
+                format!(
+                    "Discard all changes to {}? This cannot be undone.",
+                    path.display()
+                ),
+                ConfirmAction::DiscardGitChange(path),
+            ),
+            None => state.warn("no changed file selected"),
+        },
+        "git.open_diff" => open_diff(state),
+        "git.open_file" => {
+            if let Some(path) = state
+                .selected_git_path()
+                .and_then(|rel| state.git_absolute(&rel))
+            {
+                if let Err(err) = state.open_file(&path) {
+                    state.error(format!("{err:#}"));
+                }
+            }
+        }
+
+        // ── palette / workspace / app ─────────────────────────────────────
+        "palette.commands" => state.open_palette(PaletteMode::Commands),
+        "palette.quick_open" => state.open_palette(PaletteMode::Files),
+        "workspace.reload" => reload_workspace(state, services),
+        "workspace.open_config" => open_config(state),
+        "help.toggle" => state.help_visible = !state.help_visible,
+        "app.quit" => quit(state),
+        "workbench.prefix" => state.prefix_active = true,
+
+        // ── not yet connected to a running service ────────────────────────
+        other => unavailable(state, other),
+    }
+}
+
+/// Commands whose service is not running report exactly why.
+fn unavailable(state: &mut AppState, id: &str) {
+    let message = match id {
+        id if id.starts_with("lsp.") => {
+            "no language server is running for this file (configure one under [lsp] in config.toml)"
+                .to_string()
+        }
+        id if id.starts_with("debug.") => {
+            "no debug adapter is configured (add one under [dap] in config.toml)".to_string()
+        }
+        id if id.starts_with("extensions.") => {
+            "use `termloom extension install <file.vsix>` to add a package".to_string()
+        }
+        other => format!("unknown command {other}"),
+    };
+    state.warn(message);
+}
+
+// ── file helpers ──────────────────────────────────────────────────────────
+
+fn save_active(state: &mut AppState, force: bool) {
+    let Some(id) = state.active_tab else {
+        return;
+    };
+    let config = state.config.editor.clone();
+    let Some(document) = state.document_mut(id) else {
+        return;
+    };
+    if !force {
+        document.check_external_change();
+        if document.save_would_conflict() {
+            state.confirm(
+                "File changed on disk",
+                "This file changed outside TermLoom. Overwrite it with your version?",
+                ConfirmAction::OverwriteExternalChange(id),
+            );
+            return;
+        }
+    }
+    match document.save(&config) {
+        Ok(path) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            state.info(format!("saved {name}"));
+        }
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+fn save_all(state: &mut AppState) {
+    let config = state.config.editor.clone();
+    let mut saved = 0;
+    let mut errors = Vec::new();
+    for document in state.documents.iter_mut().filter(|d| d.is_dirty()) {
+        match document.save(&config) {
+            Ok(_) => saved += 1,
+            Err(err) => errors.push(format!("{err:#}")),
+        }
+    }
+    for error in errors {
+        state.error(error);
+    }
+    if saved > 0 {
+        state.info(format!("saved {saved} file(s)"));
+    }
+}
+
+fn reload_active(state: &mut AppState) {
+    let Some(id) = state.active_tab else { return };
+    let dirty = state.document(id).is_some_and(|d| d.is_dirty());
+    if dirty {
+        state.confirm(
+            "Reload file",
+            "Discard your unsaved changes and reload from disk?",
+            ConfirmAction::ReloadExternalChange(id),
+        );
+        return;
+    }
+    if let Some(document) = state.document_mut(id) {
+        if let Err(err) = document.reload() {
+            state.error(format!("{err:#}"));
+        }
+    }
+}
+
+fn close_active_tab(state: &mut AppState) {
+    let Some(id) = state.active_tab else { return };
+    if !state.close_tab(id, false) {
+        state.confirm(
+            "Unsaved changes",
+            "This file has unsaved changes. Close it anyway?",
+            ConfirmAction::CloseDirtyTab(id),
+        );
+    }
+}
+
+fn find_step(state: &mut AppState, forward: bool) {
+    let Some(document) = state.active_document_mut() else {
+        return;
+    };
+    if !document.search.is_active() {
+        return;
+    }
+    let cursor = document.buffer.cursor();
+    let hit = if forward {
+        document.search.next_from(cursor)
+    } else {
+        document.search.prev_from(cursor)
+    };
+    match hit {
+        Some(range) => {
+            document.buffer.move_to(range.start, false);
+            document.buffer.move_to(range.end, true);
+        }
+        None => state.info("no matches"),
+    }
+}
+
+fn copy_selection(state: &mut AppState, cut: bool) {
+    let Some(document) = state.active_document_mut() else {
+        return;
+    };
+    let text = match document.buffer.selected_text() {
+        Some(text) => {
+            if cut {
+                document.buffer.delete_selection();
+            }
+            text
+        }
+        None => {
+            // No selection: operate on the whole line, like most editors.
+            document.buffer.select_line();
+            let text = document.buffer.selected_text().unwrap_or_default();
+            if cut {
+                document.buffer.delete_selection();
+            } else {
+                document.buffer.clear_selection();
+            }
+            text
+        }
+    };
+    set_clipboard(state, text);
+}
+
+fn set_clipboard(state: &mut AppState, text: String) {
+    state.clipboard = text.clone();
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        Ok(()) => {}
+        Err(err) => {
+            tracing::debug!(error = %err, "system clipboard unavailable, using internal buffer")
+        }
+    }
+}
+
+fn paste(state: &mut AppState) {
+    let text = arboard::Clipboard::new()
+        .and_then(|mut c| c.get_text())
+        .unwrap_or_else(|_| state.clipboard.clone());
+    if text.is_empty() {
+        return;
+    }
+    if let Some(document) = state.active_document_mut() {
+        document.buffer.insert(&text);
+    }
+}
+
+fn toggle_comment(state: &mut AppState) {
+    let Some(document) = state.active_document_mut() else {
+        return;
+    };
+    let Some(token) = document.language.line_comment() else {
+        state.warn("no line comment syntax for this language");
+        return;
+    };
+    let cursor = document.buffer.cursor();
+    let (first, last) = match document.buffer.selection() {
+        Some(range) => (range.start.line, range.end.line),
+        None => (cursor.line, cursor.line),
+    };
+    let all_commented =
+        (first..=last).all(|line| document.buffer.line(line).trim_start().starts_with(token));
+
+    for line in first..=last {
+        let text = document.buffer.line(line).to_string();
+        let indent = text.chars().take_while(|c| c.is_whitespace()).count();
+        if all_commented {
+            let rest = text.chars().skip(indent).collect::<String>();
+            let stripped = rest
+                .strip_prefix(token)
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                .unwrap_or(&rest);
+            let removed = rest.chars().count() - stripped.chars().count();
+            if removed > 0 {
+                document.buffer.replace_range(
+                    crate::domain::diagnostics::Range::single_line(line, indent, indent + removed),
+                    "",
+                );
+            }
+        } else if !text.trim().is_empty() {
+            document.buffer.replace_range(
+                crate::domain::diagnostics::Range::single_line(line, indent, indent),
+                &format!("{token} "),
+            );
+        }
+    }
+    document.buffer.move_to(cursor, false);
+}
+
+// ── terminals ─────────────────────────────────────────────────────────────
+
+fn with_focused_terminal(
+    state: &mut AppState,
+    f: impl FnOnce(&mut crate::services::terminal::TerminalSession),
+) {
+    let Some(id) = state.focused_terminal else {
+        return;
+    };
+    if let Ok(mut terminals) = state.terminals.lock() {
+        if let Some(session) = terminals.get_mut(id) {
+            f(session);
+        }
+    }
+}
+
+fn new_terminal(state: &mut AppState) {
+    let (shell, args) = state.config.shell_command();
+    let cwd = state.workspace.root.clone();
+    let (rows, cols) = state.terminal_pane_size;
+    let scrollback = state.config.terminal.scrollback;
+
+    let result = {
+        let Ok(mut terminals) = state.terminals.lock() else {
+            state.error("terminal manager unavailable");
+            return;
+        };
+        let label = terminals.next_shell_label();
+        let mut spec = SpawnSpec::shell(label, &shell, &args, &cwd);
+        spec.rows = rows;
+        spec.cols = cols;
+        spec.scrollback = scrollback;
+        terminals.spawn(spec)
+    };
+
+    match result {
+        Ok(id) => {
+            state.layout.terminals = true;
+            state.focus_terminal(id);
+        }
+        Err(err) => state.error(format!("could not start a terminal: {err:#}")),
+    }
+}
+
+fn restart_terminal(state: &mut AppState) {
+    let Some(id) = state.focused_terminal else {
+        return;
+    };
+    let result = state
+        .terminals
+        .lock()
+        .map_err(|_| anyhow::anyhow!("terminal manager unavailable"))
+        .and_then(|mut terminals| terminals.restart(id));
+    match result {
+        Ok(new_id) => state.focus_terminal(new_id),
+        Err(err) => state.error(format!("restart failed: {err:#}")),
+    }
+}
+
+// ── agents ────────────────────────────────────────────────────────────────
+
+/// Refresh the agent list from every backend.
+pub fn refresh_agents(state: &mut AppState, services: &mut Services) {
+    let registry = &services.agents;
+    let agents = services.runtime.block_on(async {
+        registry.refresh_all().await;
+        registry.list_all().await
+    });
+    state.agents = agents;
+    state.agent_selection.clamp(state.agents.len());
+}
+
+fn spawn_preset(state: &mut AppState, services: &mut Services, name: &str) {
+    let Some(preset) = state.config.agents.get(name).cloned() else {
+        state.error(format!("no `[agents.{name}]` preset is configured"));
+        return;
+    };
+    if which(&preset.command).is_none() {
+        state.error(format!(
+            "`{}` was not found on PATH — install it or set [agents.{name}] command",
+            preset.command
+        ));
+        return;
+    }
+    let mut request = request_from_preset(name, &preset, state.workspace.root.clone());
+    let (rows, cols) = state.terminal_pane_size;
+    request.rows = rows;
+    request.cols = cols;
+    spawn_agent(state, services, request);
+}
+
+fn spawn_shell_agent(state: &mut AppState, services: &mut Services) {
+    let (shell, args) = state.config.shell_command();
+    let (rows, cols) = state.terminal_pane_size;
+    let request = SpawnAgentRequest {
+        kind: AgentKind::Shell,
+        label: "Shell".into(),
+        program: shell,
+        args,
+        cwd: state.workspace.root.clone(),
+        env: Vec::new(),
+        rows,
+        cols,
+    };
+    spawn_agent(state, services, request);
+}
+
+/// Launch an agent through the primary backend.
+pub fn spawn_agent(state: &mut AppState, services: &mut Services, request: SpawnAgentRequest) {
+    let label = request.label.clone();
+    let Some(backend) = services.agents.primary().cloned() else {
+        state.error("no agent backend is available");
+        return;
+    };
+    match services.runtime.block_on(backend.spawn_agent(request)) {
+        Ok(session) => {
+            state.layout.terminals = true;
+            state.layout.agents = true;
+            if let Some(terminal) = session.terminal_id {
+                state.focus_terminal(terminal);
+            }
+            // Snapshot the current git changes so the Files tab can show what
+            // appeared *after* the session started.
+            let baseline = state
+                .git
+                .changes
+                .iter()
+                .map(|c| c.path.clone())
+                .collect::<Vec<_>>();
+            state.agent_files_baseline = Some((session.id, baseline));
+            refresh_agents(state, services);
+            if let Some(index) = state.agents.iter().position(|a| a.id == session.id) {
+                state.agent_selection.selected = index;
+            }
+            state.info(format!("started {label}"));
+        }
+        Err(err) => state.error(format!("could not start {label}: {err:#}")),
+    }
+}
+
+/// Find a program on `PATH` (also accepts an explicit path).
+pub fn which(program: &str) -> Option<PathBuf> {
+    let candidate = Path::new(program);
+    if candidate.is_absolute() || program.contains('/') {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
+        let full = dir.join(program);
+        full.is_file().then_some(full)
+    })
+}
+
+// ── git ───────────────────────────────────────────────────────────────────
+
+fn git_operation(state: &mut AppState, services: &mut Services, operation: &str) {
+    let Some(root) = state.git_root() else {
+        state.warn("not a git repository");
+        return;
+    };
+    let path = state.selected_git_path();
+    let result = match (operation, path.as_ref()) {
+        ("stage", Some(path)) => git::stage(&root, path),
+        ("unstage", Some(path)) => git::unstage(&root, path),
+        ("stage_all", _) => git::stage_all(&root),
+        ("unstage_all", _) => git::unstage_all(&root),
+        _ => {
+            state.warn("no changed file selected");
+            return;
+        }
+    };
+    match result {
+        Ok(()) => services.refresh_git(Some(root)),
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+fn open_diff(state: &mut AppState) {
+    let (Some(root), Some(path)) = (state.git_root(), state.selected_git_path()) else {
+        state.warn("no changed file selected");
+        return;
+    };
+    let staged = state
+        .git
+        .changes
+        .get(state.git_selection.selected)
+        .is_some_and(|c| c.is_staged());
+    match git::diff_file(&root, &path, staged) {
+        Ok(diff) => {
+            state.diff = Some(diff);
+            state.diff_scroll = 0;
+        }
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+// ── workspace ─────────────────────────────────────────────────────────────
+
+fn reload_workspace(state: &mut AppState, services: &mut Services) {
+    let (config, diagnostics) = crate::config::Config::load(Some(&state.workspace.root));
+    state.keymap = config.keymap();
+    state.config = config;
+    state.config_diagnostics = diagnostics;
+    state.refresh_tree();
+    services.refresh_git(state.git_root());
+    services.reindex(
+        &state.workspace.root,
+        ScanOptions::from_config(&state.config.workspace),
+    );
+    state.indexing = true;
+    for diagnostic in state.config_diagnostics.clone() {
+        state.error(format!(
+            "{}: {}",
+            diagnostic.path.display(),
+            diagnostic.message
+        ));
+    }
+    state.info("workspace reloaded");
+}
+
+fn open_config(state: &mut AppState) {
+    let project = state
+        .workspace
+        .root
+        .join(crate::config::PROJECT_CONFIG_FILE);
+    let path = if project.exists() {
+        Some(project)
+    } else {
+        crate::config::global_config_path().filter(|p| p.exists())
+    };
+    match path {
+        Some(path) => {
+            if let Err(err) = state.open_file(&path) {
+                state.error(format!("{err:#}"));
+            }
+        }
+        None => state.info(
+            "no configuration file yet — create .termloom.toml in the project or run `termloom config --write-default`",
+        ),
+    }
+}
+
+fn quit(state: &mut AppState) {
+    if state.has_unsaved_changes() {
+        state.confirm(
+            "Unsaved changes",
+            "Some files have unsaved changes. Quit anyway?",
+            ConfirmAction::QuitWithUnsavedChanges,
+        );
+        return;
+    }
+    state.should_quit = true;
+}
+
+// ── modal results ─────────────────────────────────────────────────────────
+
+/// Apply a confirmed destructive action.
+pub fn apply_confirm(state: &mut AppState, services: &mut Services, action: ConfirmAction) {
+    match action {
+        ConfirmAction::DeletePath(path) => {
+            match fs_ops::delete(&state.workspace.root, &path) {
+                Ok(()) => {
+                    // Close any tab showing the deleted file.
+                    if let Some(id) = state.document_for_path(&path).map(|d| d.id) {
+                        state.close_tab(id, true);
+                    }
+                    state.refresh_tree();
+                    services.refresh_git(state.git_root());
+                    state.info(format!("deleted {}", path.display()));
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            }
+        }
+        ConfirmAction::DiscardGitChange(path) => {
+            let Some(root) = state.git_root() else { return };
+            match git::discard(&root, &path) {
+                Ok(()) => {
+                    let absolute = root.join(&path);
+                    if let Some(document) = state
+                        .documents
+                        .iter_mut()
+                        .find(|d| d.path.as_deref() == Some(absolute.as_path()))
+                    {
+                        let _ = document.reload();
+                    }
+                    services.refresh_git(Some(root));
+                    state.info(format!("discarded changes to {}", path.display()));
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            }
+        }
+        ConfirmAction::CloseDirtyTab(id) => {
+            state.close_tab(id, true);
+        }
+        ConfirmAction::OverwriteExternalChange(id) => {
+            state.active_tab = Some(id);
+            save_active(state, true);
+        }
+        ConfirmAction::ReloadExternalChange(id) => {
+            if let Some(document) = state.document_mut(id) {
+                if let Err(err) = document.reload() {
+                    state.error(format!("{err:#}"));
+                }
+            }
+        }
+        ConfirmAction::StopAgent(id) => {
+            let registry = &services.agents;
+            let result = services.runtime.block_on(async {
+                match registry.owner(id).await {
+                    Some(backend) => backend.stop(id).await,
+                    None => Ok(()),
+                }
+            });
+            if let Err(err) = result {
+                state.error(format!("stop failed: {err:#}"));
+            }
+            refresh_agents(state, services);
+        }
+        ConfirmAction::RemoveExtension(id) => {
+            state.warn(format!(
+                "use `termloom extension remove {id}` to remove this package"
+            ));
+        }
+        ConfirmAction::QuitWithUnsavedChanges => state.should_quit = true,
+    }
+}
+
+/// Apply a prompt result.
+pub fn apply_prompt(
+    state: &mut AppState,
+    services: &mut Services,
+    purpose: PromptPurpose,
+    value: String,
+) {
+    let value = value.trim().to_string();
+    match purpose {
+        PromptPurpose::NewFile(dir) => {
+            if value.is_empty() {
+                return;
+            }
+            match fs_ops::create_file(&state.workspace.root, &dir.join(&value)) {
+                Ok(path) => {
+                    state.refresh_tree();
+                    state.reveal_in_explorer(&path);
+                    if let Err(err) = state.open_file(&path) {
+                        state.error(format!("{err:#}"));
+                    }
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            }
+        }
+        PromptPurpose::NewFolder(dir) => {
+            if value.is_empty() {
+                return;
+            }
+            match fs_ops::create_dir(&state.workspace.root, &dir.join(&value)) {
+                Ok(path) => {
+                    state.refresh_tree();
+                    state.reveal_in_explorer(&path);
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            }
+        }
+        PromptPurpose::Rename(from) => {
+            if value.is_empty() {
+                return;
+            }
+            let to = from
+                .parent()
+                .map(|parent| parent.join(&value))
+                .unwrap_or_else(|| PathBuf::from(&value));
+            match fs_ops::rename(&state.workspace.root, &from, &to) {
+                Ok(path) => {
+                    if let Some(document) = state
+                        .documents
+                        .iter_mut()
+                        .find(|d| d.path.as_deref() == Some(from.as_path()))
+                    {
+                        document.path = Some(path.clone());
+                    }
+                    state.refresh_tree();
+                    state.reveal_in_explorer(&path);
+                    services.refresh_git(state.git_root());
+                }
+                Err(err) => state.error(format!("{err:#}")),
+            }
+        }
+        PromptPurpose::GotoLine => {
+            let Ok(line) = value.parse::<usize>() else {
+                state.warn("enter a line number");
+                return;
+            };
+            if let Some(document) = state.active_document_mut() {
+                document.goto(Position::new(line.saturating_sub(1), 0));
+            }
+        }
+        PromptPurpose::FindInFile => {
+            let Some(document) = state.active_document_mut() else {
+                return;
+            };
+            document.search.query = value;
+            document.search.refresh(&document.buffer);
+            let cursor = document.buffer.cursor();
+            if let Some(range) = document.search.next_from(cursor) {
+                document.buffer.move_to(range.start, false);
+                document.buffer.move_to(range.end, true);
+            } else if document.search.is_active() {
+                state.info("no matches");
+            }
+        }
+        PromptPurpose::AgentRename(id) => {
+            if value.is_empty() {
+                return;
+            }
+            let registry = &services.agents;
+            let result = services.runtime.block_on(async {
+                match registry.owner(id).await {
+                    Some(backend) => backend.rename(id, &value).await,
+                    None => Ok(()),
+                }
+            });
+            if let Err(err) = result {
+                state.error(format!("rename failed: {err:#}"));
+            }
+            refresh_agents(state, services);
+        }
+        PromptPurpose::AgentInput(id) => {
+            let registry = &services.agents;
+            let bytes = crate::services::terminal::input::encode_text(&format!("{value}\n"));
+            let result = services.runtime.block_on(async {
+                match registry.owner(id).await {
+                    Some(backend) => backend.send_input(id, &bytes).await,
+                    None => Err(anyhow::anyhow!("no backend owns this agent")),
+                }
+            });
+            match result {
+                Ok(()) => state.info("sent"),
+                Err(err) => state.error(format!("send failed: {err:#}")),
+            }
+        }
+        PromptPurpose::AgentTask(id) => {
+            if value.is_empty() {
+                return;
+            }
+            if let Some(agent) = state.agents.iter_mut().find(|a| a.id == id) {
+                agent.tasks.push(crate::domain::agent::AgentTask {
+                    text: value,
+                    done: false,
+                });
+                state.agent_tab = AgentDetailTab::Tasks;
+            }
+        }
+        PromptPurpose::CustomAgentCommand => {
+            if value.is_empty() {
+                return;
+            }
+            let parts = match shell_words::split(&value) {
+                Ok(parts) if !parts.is_empty() => parts,
+                _ => {
+                    state.warn("could not parse that command");
+                    return;
+                }
+            };
+            let (program, args) = parts.split_first().unwrap();
+            if which(program).is_none() {
+                state.error(format!("`{program}` was not found on PATH"));
+                return;
+            }
+            let (rows, cols) = state.terminal_pane_size;
+            let request = SpawnAgentRequest {
+                kind: AgentKind::from_command(program),
+                label: program.clone(),
+                program: program.clone(),
+                args: args.to_vec(),
+                cwd: state.workspace.root.clone(),
+                env: Vec::new(),
+                rows,
+                cols,
+            };
+            spawn_agent(state, services, request);
+        }
+        PromptPurpose::InstallVsix | PromptPurpose::InspectVsix => {
+            state.warn("use `termloom extension install <file.vsix>` for now");
+        }
+        PromptPurpose::RenameSymbol(_) => {
+            state.warn("no language server is running for this file");
+        }
+    }
+}
+
+/// Refresh the agent Files tab against the baseline captured at launch.
+pub fn refresh_agent_files(state: &mut AppState) {
+    let Some(agent) = state.selected_agent() else {
+        state.agent_files.clear();
+        return;
+    };
+    let baseline = match &state.agent_files_baseline {
+        Some((id, paths)) if *id == agent.id => paths.clone(),
+        _ => Vec::new(),
+    };
+    state.agent_files = state
+        .git
+        .changes
+        .iter()
+        .map(|c| c.path.clone())
+        .filter(|path| !baseline.contains(path))
+        .collect();
+}
+
+/// Keep the dashboard honest when a terminal exits.
+pub fn handle_terminal_exit(
+    state: &mut AppState,
+    services: &mut Services,
+    id: crate::domain::ids::TerminalId,
+    code: Option<i32>,
+) {
+    if let Ok(mut terminals) = state.terminals.lock() {
+        terminals.mark_exited(id, code);
+    }
+    refresh_agents(state, services);
+    if let Some(agent) = state
+        .agents
+        .iter()
+        .find(|a| a.terminal_id == Some(id) && a.state == AgentState::Failed)
+    {
+        let label = agent.label.clone();
+        state.notify(Notice::warning(format!("{label} exited with an error")));
+    }
+}

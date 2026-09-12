@@ -11,7 +11,10 @@ them to a GitHub Release with checksums, and makes
 The install script and landing page are served from Pages.
 
 1. Repository **Settings → Pages → Build and deployment → Source**: choose
-   **GitHub Actions**.
+   **GitHub Actions**. Until this is set, the `Site` workflow fails on its
+   first step with *"Get Pages site failed … verify that the repository has
+   Pages enabled"* — that is the switch it is asking for, not a broken
+   workflow. Re-run the workflow afterwards.
 2. Push to `main` once; the `Site` workflow publishes `site/` plus a copy of
    `install.sh`.
 3. Confirm `https://ghassenbrg.github.io/termloom/install.sh` serves the script.

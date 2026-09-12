@@ -211,15 +211,28 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     frame.render_widget(Paragraph::new(lines), rows[1]);
 }
 
+/// Short, readable name for where a state reading came from.
+fn source_label(source: crate::domain::agent::ObservationSource) -> &'static str {
+    use crate::domain::agent::ObservationSource::*;
+    match source {
+        Process => "process",
+        OutputActivity => "output",
+        OutputMarker => "prompt",
+        Backend => "backend",
+        User => "user",
+    }
+}
+
 fn status_lines<'a>(agent: &'a AgentSession, state: &AppState, theme: &Theme) -> Vec<Line<'a>> {
     let terminal = agent
         .terminal_id
         .map(|id| format!("#{}", id.raw()))
         .unwrap_or_else(|| "none".into());
     // Provenance is shown so a heuristic state is never mistaken for fact.
+    // Kept short so it survives a narrow agents column.
     let source = format!(
-        "{:?} · confidence {:.0}%",
-        agent.state_source,
+        "{} · {:.0}%",
+        source_label(agent.state_source),
         agent.confidence * 100.0
     );
     let mut lines = vec![
@@ -239,7 +252,7 @@ fn status_lines<'a>(agent: &'a AgentSession, state: &AppState, theme: &Theme) ->
                 theme.dim(),
             ),
         ]),
-        field("state from", source, theme),
+        field("observed", source, theme),
         field("type", agent.kind.label().to_string(), theme),
         field("command", agent.command.join(" "), theme),
         field(

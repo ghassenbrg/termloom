@@ -255,7 +255,7 @@ fn draw_sidebar(
     // language-server block.
     let show_outline = state.layout.outline && mode == LayoutMode::Large && area.height >= 26;
     let show_git = state.layout.git && area.height >= 16;
-    let show_lsp = mode == LayoutMode::Large && area.height >= 34;
+    let show_lsp = mode == LayoutMode::Large && area.height >= 24;
 
     let mut constraints = vec![Constraint::Min(6)];
     if show_outline {

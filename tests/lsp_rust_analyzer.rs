@@ -273,3 +273,83 @@ fn a_crashing_server_is_reported_and_does_not_hang() {
     }
     assert!(saw_exit, "a dead server must report its exit");
 }
+
+/// Regression: the workbench ticks while a server is still starting, and a
+/// `textDocument/didOpen` sent before the `initialized` notification makes
+/// rust-analyzer exit — which used to leave language intelligence silently
+/// off. The manager must refuse document notifications until the server is
+/// ready, then accept them.
+#[test]
+fn documents_are_not_synced_before_the_server_is_initialised() {
+    use std::sync::mpsc;
+    use termloom::config::{Config, LspServerConfig};
+    use termloom::services::lsp::{LspManager, RequestExtra};
+    use termloom::services::syntax::LanguageId;
+
+    let Some(command) = rust_analyzer() else {
+        eprintln!("skipping: rust-analyzer is not installed");
+        return;
+    };
+    let dir = project();
+    let root = dir.path();
+    let main = root.join("src/main.rs");
+    let source = std::fs::read_to_string(&main).unwrap();
+    let rust = LanguageId::new("rust");
+
+    let (tx, rx) = mpsc::channel();
+    let sink: LspSink = Arc::new(move |event| {
+        let _ = tx.send(event);
+    });
+    let mut config = Config::default();
+    config.lsp.insert(
+        "rust-analyzer".into(),
+        LspServerConfig {
+            command,
+            languages: vec!["rust".into()],
+            root_markers: vec!["Cargo.toml".into()],
+            ..Default::default()
+        },
+    );
+    let mut manager = LspManager::new(&config, root, sink);
+    manager.ensure_started(&rust).expect("server should start");
+
+    // The very next tick tries to synchronise the open document.
+    assert!(
+        !manager.did_open(&main, &rust, &source),
+        "a starting server must not be sent documents"
+    );
+
+    let collector = Collector { events: rx };
+    collector
+        .wait(|event| matches!(event, LspEvent::Initialized { .. }).then_some(()))
+        .expect("the server should still initialise");
+
+    assert!(
+        manager.did_open(&main, &rust, &source),
+        "an initialised server accepts the document"
+    );
+
+    // And it is still alive and answering afterwards.
+    manager
+        .request(
+            &rust,
+            RequestKind::DocumentSymbols,
+            &main,
+            Position::default(),
+            RequestExtra::None,
+        )
+        .expect("requests should be accepted");
+    let symbols = collector
+        .wait_for(Duration::from_secs(60), |event| match event {
+            LspEvent::Response {
+                kind: RequestKind::DocumentSymbols,
+                result: LspResult::Symbols(symbols),
+                ..
+            } if !symbols.is_empty() => Some(symbols.clone()),
+            _ => None,
+        })
+        .expect("the server should answer after a correct handshake");
+    assert!(symbols.iter().any(|symbol| symbol.name == "greet"));
+
+    manager.shutdown_all();
+}

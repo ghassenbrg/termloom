@@ -194,6 +194,25 @@ fn walk<'a>(
 
 /// Best-effort name for a symbol node.
 fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+    // Rust impl blocks have no name field; show them the way they are written
+    // so `Foo` the struct and `impl Foo` are not two identical rows.
+    if node.kind() == "impl_item" {
+        let type_name = node
+            .child_by_field_name("type")
+            .and_then(|child| node_text(child, source))
+            .map(clean_name)?;
+        return Some(
+            match node
+                .child_by_field_name("trait")
+                .and_then(|child| node_text(child, source))
+            {
+                Some(trait_name) => {
+                    clean_name(format!("impl {} for {type_name}", trait_name.trim()))
+                }
+                None => format!("impl {type_name}"),
+            },
+        );
+    }
     // Most grammars expose a `name` field.
     for field in ["name", "key", "path"] {
         if let Some(child) = node.child_by_field_name(field) {
@@ -251,6 +270,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn impl_blocks_are_labelled_as_written() {
+        let mut extractor = OutlineExtractor::new();
+        let src = "struct Widget;\nimpl Widget { fn new() {} }\nimpl Clone for Widget { fn clone(&self) -> Self { Widget } }\n";
+        let symbols = extractor.extract(&LanguageId::new("rust"), src).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Widget"), "{names:?}");
+        assert!(names.contains(&"impl Widget"), "{names:?}");
+        assert!(names.contains(&"impl Clone for Widget"), "{names:?}");
+    }
+
+    #[test]
     fn extracts_rust_structure_with_nesting() {
         let mut extractor = OutlineExtractor::new();
         let src = r#"
@@ -271,7 +301,7 @@ mod app {
         let new_fn = symbols.iter().find(|s| s.name == "new").unwrap();
         assert_eq!(new_fn.kind, SymbolKind::Function);
         assert!(new_fn.depth >= 2, "nested symbols keep their depth");
-        assert_eq!(new_fn.container.as_deref(), Some("State"));
+        assert_eq!(new_fn.container.as_deref(), Some("impl State"));
     }
 
     #[test]

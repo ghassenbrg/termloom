@@ -42,7 +42,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 (true, ClientStatus::Starting) => ("◌", "Starting", theme.accent),
                 (true, ClientStatus::Failed) => ("×", "Failed", theme.danger),
                 (true, ClientStatus::Exited) => ("▫", "Stopped", theme.text_dim),
-                // Configured but never started: available on demand.
+                // Not running: either it failed to start, or it simply has
+                // not been needed yet. Never imply the first is the second.
+                (false, _) if server.failure.is_some() => ("×", "Failed", theme.danger),
                 (false, _) => ("○", "Available", theme.text_dim),
             };
             let budget = (inner.width as usize).saturating_sub(label.len() + 3);

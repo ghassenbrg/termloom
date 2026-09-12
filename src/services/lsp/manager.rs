@@ -22,9 +22,11 @@ pub struct ServerStatus {
     pub name: String,
     pub languages: Vec<String>,
     pub status: ClientStatus,
-    /// `None` until the server is configured but not started.
+    /// False when the server is configured but not started.
     pub running: bool,
     pub command: String,
+    /// Why the server is not running, when it should be.
+    pub failure: Option<String>,
 }
 
 /// Owns every language server client.
@@ -102,6 +104,7 @@ impl LspManager {
                         .unwrap_or(ClientStatus::Exited),
                     running: client.is_some(),
                     command: config.command.clone(),
+                    failure: self.failures.get(name).cloned(),
                 }
             })
             .collect();
@@ -182,31 +185,56 @@ impl LspManager {
         self.clients.get_mut(&name)
     }
 
+    /// A client that has finished `initialize`.
+    ///
+    /// Document notifications sent before the `initialized` notification are
+    /// a protocol violation — rust-analyzer, for one, exits — so a starting
+    /// server is treated as absent until it is ready. The workbench re-opens
+    /// every document once the server reports that it is.
+    fn ready_client_for(&mut self, language: &LanguageId) -> Option<&mut LspClient> {
+        let client = self.client_for(language)?;
+        (client.status() == ClientStatus::Ready).then_some(client)
+    }
+
     // ── document lifecycle ────────────────────────────────────────────────
 
-    pub fn did_open(&mut self, path: &Path, language: &LanguageId, text: &str) {
+    /// Returns whether the notification was sent, so the caller knows whether
+    /// the document is really in sync with a server.
+    pub fn did_open(&mut self, path: &Path, language: &LanguageId, text: &str) -> bool {
         let language_id = language.as_str().to_string();
-        if let Some(client) = self.client_for(language) {
-            if !client.is_open(path) {
-                if let Err(err) = client.did_open(path, &language_id, text) {
-                    tracing::warn!(error = %err, "didOpen failed");
-                }
+        let Some(client) = self.ready_client_for(language) else {
+            return false;
+        };
+        if client.is_open(path) {
+            return true;
+        }
+        match client.did_open(path, &language_id, text) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "didOpen failed");
+                false
             }
         }
     }
 
-    pub fn did_change(&mut self, path: &Path, language: &LanguageId, text: &str) {
-        if let Some(client) = self.client_for(language) {
-            if client.is_open(path) {
-                if let Err(err) = client.did_change(path, text) {
-                    tracing::warn!(error = %err, "didChange failed");
-                }
+    pub fn did_change(&mut self, path: &Path, language: &LanguageId, text: &str) -> bool {
+        let Some(client) = self.ready_client_for(language) else {
+            return false;
+        };
+        if !client.is_open(path) {
+            return false;
+        }
+        match client.did_change(path, text) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "didChange failed");
+                false
             }
         }
     }
 
     pub fn did_save(&mut self, path: &Path, language: &LanguageId, text: &str) {
-        if let Some(client) = self.client_for(language) {
+        if let Some(client) = self.ready_client_for(language) {
             if client.is_open(path) {
                 if let Err(err) = client.did_save(path, Some(text)) {
                     tracing::warn!(error = %err, "didSave failed");
@@ -216,7 +244,7 @@ impl LspManager {
     }
 
     pub fn did_close(&mut self, path: &Path, language: &LanguageId) {
-        if let Some(client) = self.client_for(language) {
+        if let Some(client) = self.ready_client_for(language) {
             if client.is_open(path) {
                 let _ = client.did_close(path);
             }

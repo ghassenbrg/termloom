@@ -426,11 +426,16 @@ impl App {
             .collect();
 
         for (path, language, text, version, synced) in documents {
-            if synced < 0 || force_open {
-                self.services.lsp.did_open(&path, &language, &text);
+            let sent = if synced < 0 || force_open {
+                self.services.lsp.did_open(&path, &language, &text)
             } else if synced != version {
-                self.services.lsp.did_change(&path, &language, &text);
+                self.services.lsp.did_change(&path, &language, &text)
             } else {
+                continue;
+            };
+            // A server that is still starting takes nothing: leave the
+            // document unsynced so it is opened again once the server is up.
+            if !sent {
                 continue;
             }
             if let Some(document) = self
@@ -455,12 +460,15 @@ impl App {
                 self.state.lsp_statuses = self.services.lsp.statuses();
             }
             Err(err) => {
-                // Only complain once per server.
+                // Say why once per server: silently running without language
+                // intelligence is worse than a one-line explanation.
                 let message = format!("{err:#}");
                 if self.state.lsp_message.as_deref() != Some(message.as_str()) {
-                    self.state.lsp_message = Some(message.clone());
                     tracing::debug!(error = %message, "language server unavailable");
+                    self.state.lsp_message = Some(message.clone());
+                    self.state.warn(message);
                 }
+                self.state.lsp_statuses = self.services.lsp.statuses();
             }
         }
     }

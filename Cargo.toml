@@ -1,0 +1,78 @@
+[package]
+name = "termloom"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Agent-native development environment for your terminal"
+license = "MIT"
+repository = "https://github.com/ghassenbrg/termloom"
+default-run = "termloom"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+
+# async / runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "net"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+
+# terminal / pty
+portable-pty = "0.9"
+vt100 = "0.15"
+
+# filesystem
+notify = "8"
+notify-debouncer-full = "0.5"
+ignore = "0.4"
+walkdir = "2"
+
+# git
+git2 = { version = "0.20", default-features = false }
+
+# syntax
+tree-sitter = "0.25"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-json = "0.24"
+tree-sitter-bash = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-md = "0.3"
+
+# serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+
+# cli / errors / logging
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# misc
+nucleo-matcher = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+similar = "2"
+shell-words = "1"
+arboard = { version = "3", default-features = false }
+tree-sitter-dart = "0.2"
+streaming-iterator = "0.1.9"
+
+[dev-dependencies]
+tempfile = "3"
+insta = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

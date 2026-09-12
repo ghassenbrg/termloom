@@ -14,12 +14,12 @@ use anyhow::{anyhow, Result};
 use crate::config::{Config, ConfigDiagnostic, Keymap};
 use crate::domain::agent::{AgentSession, AgentState};
 use crate::domain::debug::{DebugCapabilities, DebugStatus, DebugThread, StackFrame, Variable};
+use crate::domain::diagnostics::Location;
 use crate::domain::diagnostics::{Diagnostic, Position, Severity};
 use crate::domain::extensions::CompatibilityReport;
 use crate::domain::git::{FileDiff, GitSnapshot};
 use crate::domain::ids::{AgentId, EditorTabId, TerminalId};
 use crate::editor::Document;
-use crate::domain::diagnostics::Location;
 use crate::services::lsp::{CompletionItem, ServerStatus};
 use crate::services::syntax::{Highlighter, LanguageRegistry, OutlineExtractor};
 use crate::services::terminal::TerminalManager;
@@ -151,6 +151,10 @@ impl PaletteState {
 /// through one of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
+    /// Run a debug adapter after showing the exact command line.
+    StartDebugSession(Box<crate::services::dap::DebugLaunchConfig>),
+    /// Run a repository-defined task in a terminal.
+    RunTask(crate::services::vscode::VsCodeTask),
     DeletePath(PathBuf),
     DiscardGitChange(PathBuf),
     CloseDirtyTab(EditorTabId),
@@ -178,6 +182,15 @@ pub enum PromptPurpose {
     RenameSymbol(Position),
 }
 
+/// What a selection dialog is choosing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectPurpose {
+    /// Pick a debug configuration to launch.
+    DebugConfiguration(Vec<crate::services::dap::LaunchEntry>),
+    /// Pick a `.vscode/tasks.json` task to run in a terminal.
+    Task(Vec<crate::services::vscode::VsCodeTask>),
+}
+
 /// A blocking dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -194,6 +207,12 @@ pub enum Modal {
     Message {
         title: String,
         body: Vec<String>,
+    },
+    Select {
+        title: String,
+        options: Vec<String>,
+        selected: usize,
+        purpose: SelectPurpose,
     },
 }
 
@@ -284,7 +303,9 @@ impl CompletionPopup {
     }
 
     pub fn selection(&self) -> Option<CompletionItem> {
-        self.filtered().get(self.selected).map(|item| (*item).clone())
+        self.filtered()
+            .get(self.selected)
+            .map(|item| (*item).clone())
     }
 }
 
@@ -939,6 +960,22 @@ impl AppState {
         self.modal = Some(Modal::Prompt {
             title: title.into(),
             value: value.into(),
+            purpose,
+        });
+        self.focus = FocusTarget::Modal;
+    }
+
+    /// Ask the user to choose from a list.
+    pub fn select(
+        &mut self,
+        title: impl Into<String>,
+        options: Vec<String>,
+        purpose: SelectPurpose,
+    ) {
+        self.modal = Some(Modal::Select {
+            title: title.into(),
+            options,
+            selected: 0,
             purpose,
         });
         self.focus = FocusTarget::Modal;

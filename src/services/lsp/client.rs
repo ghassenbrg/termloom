@@ -17,8 +17,8 @@ use serde_json::{json, Value};
 use crate::config::LspServerConfig;
 use crate::domain::diagnostics::{Diagnostic, Location, Position, Symbol};
 
-use super::framing;
 use super::protocol::{self, CompletionItem, ServerCapabilities, TextEdit};
+use crate::services::framing;
 
 /// Which request a response belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +84,7 @@ pub enum LspEvent {
         message: String,
     },
     /// Server-reported progress or log message worth surfacing.
-    Status {
-        server: String,
-        message: String,
-    },
+    Status { server: String, message: String },
     Exited {
         server: String,
         status: Option<i32>,
@@ -439,11 +436,7 @@ fn handle_message(
                 return;
             }
 
-            let Some(entry) = pending
-                .lock()
-                .ok()
-                .and_then(|mut map| map.remove(&id))
-            else {
+            let Some(entry) = pending.lock().ok().and_then(|mut map| map.remove(&id)) else {
                 return;
             };
             if let Some(error) = message.get("error") {
@@ -478,7 +471,8 @@ fn handle_message(
                     .unwrap_or(1);
                 Value::Array(vec![Value::Null; count])
             }
-            "window/workDoneProgress/create" | "client/registerCapability"
+            "window/workDoneProgress/create"
+            | "client/registerCapability"
             | "client/unregisterCapability" => Value::Null,
             "workspace/applyEdit" => json!({ "applied": false }),
             _ => Value::Null,
@@ -590,8 +584,8 @@ mod tests {
 
     #[test]
     fn toml_values_convert_to_json() {
-        let value: toml::Value = toml::from_str("a = 1\nb = [true, \"x\"]\n[c]\nd = 2.5\n")
-            .unwrap();
+        let value: toml::Value =
+            toml::from_str("a = 1\nb = [true, \"x\"]\n[c]\nd = 2.5\n").unwrap();
         let json = toml_to_json(value);
         assert_eq!(json["a"], 1);
         assert_eq!(json["b"][1], "x");
@@ -611,10 +605,7 @@ mod tests {
 
     #[test]
     fn request_kinds_convert_their_results() {
-        let hover = convert(
-            RequestKind::Hover,
-            &serde_json::json!({"contents": "text"}),
-        );
+        let hover = convert(RequestKind::Hover, &serde_json::json!({"contents": "text"}));
         assert!(matches!(hover, LspResult::Hover(lines) if lines == vec!["text"]));
 
         let empty = convert(RequestKind::Formatting, &Value::Null);

@@ -1,4 +1,4 @@
-//! JSON-RPC base protocol framing, shared by the LSP and DAP clients.
+//! Base protocol framing, shared by the LSP and DAP clients.
 //!
 //! Both protocols use the same envelope: `Content-Length: N\r\n\r\n` followed
 //! by N bytes of JSON. The decoder is a pure state machine so it can be tested
@@ -92,8 +92,7 @@ impl Decoder {
                 break;
             }
             let body = &self.buffer[header_end + 4..total];
-            let value: Value =
-                serde_json::from_slice(body).context("parsing the message body")?;
+            let value: Value = serde_json::from_slice(body).context("parsing the message body")?;
             out.push(value);
             self.buffer.drain(..total);
         }

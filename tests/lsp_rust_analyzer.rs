@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 
 use termloom::config::LspServerConfig;
 use termloom::domain::diagnostics::Position;
+use termloom::services::lsp::protocol;
 use termloom::services::lsp::{
     ClientStatus, LspClient, LspEvent, LspResult, LspSink, RequestContext, RequestKind,
 };
-use termloom::services::lsp::protocol;
 
 fn rust_analyzer() -> Option<String> {
     let paths = std::env::var_os("PATH")?;
@@ -68,7 +68,10 @@ impl Collector {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.events.recv_timeout(remaining.min(Duration::from_secs(5))) {
+            match self
+                .events
+                .recv_timeout(remaining.min(Duration::from_secs(5)))
+            {
                 Ok(event) => {
                     if let Some(value) = predicate(&event) {
                         return Some(value);
@@ -130,26 +133,31 @@ fn rust_analyzer_initializes_and_answers_requests() {
     // empty result until it has loaded the crate graph, so retry the way an
     // editor would rather than failing on the first empty answer.
     let hover_position = Position::new(5, 19);
-    let hover = retry(&collector, Duration::from_secs(180), || {
-        client
-            .request(
-                RequestKind::Hover,
-                "textDocument/hover",
-                protocol::text_document_position(&main, hover_position),
-                RequestContext {
-                    path: main.clone(),
-                    position: hover_position,
-                },
-            )
-            .unwrap();
-    }, |event| match event {
-        LspEvent::Response {
-            kind: RequestKind::Hover,
-            result: LspResult::Hover(lines),
-            ..
-        } if !lines.is_empty() => Some(lines.clone()),
-        _ => None,
-    })
+    let hover = retry(
+        &collector,
+        Duration::from_secs(180),
+        || {
+            client
+                .request(
+                    RequestKind::Hover,
+                    "textDocument/hover",
+                    protocol::text_document_position(&main, hover_position),
+                    RequestContext {
+                        path: main.clone(),
+                        position: hover_position,
+                    },
+                )
+                .unwrap();
+        },
+        |event| match event {
+            LspEvent::Response {
+                kind: RequestKind::Hover,
+                result: LspResult::Hover(lines),
+                ..
+            } if !lines.is_empty() => Some(lines.clone()),
+            _ => None,
+        },
+    )
     .expect("hover should return documentation");
     assert!(
         hover.iter().any(|line| line.contains("greet")),
@@ -157,32 +165,40 @@ fn rust_analyzer_initializes_and_answers_requests() {
     );
 
     // 5. Go to definition jumps back to the function.
-    let locations = retry(&collector, Duration::from_secs(60), || {
-        client
-            .request(
-                RequestKind::Definition,
-                "textDocument/definition",
-                protocol::text_document_position(&main, hover_position),
-                RequestContext {
-                    path: main.clone(),
-                    position: hover_position,
-                },
-            )
-            .unwrap();
-    }, |event| match event {
-        LspEvent::Response {
-            kind: RequestKind::Definition,
-            result: LspResult::Locations(locations),
-            ..
-        } if !locations.is_empty() => Some(locations.clone()),
-        _ => None,
-    })
+    let locations = retry(
+        &collector,
+        Duration::from_secs(60),
+        || {
+            client
+                .request(
+                    RequestKind::Definition,
+                    "textDocument/definition",
+                    protocol::text_document_position(&main, hover_position),
+                    RequestContext {
+                        path: main.clone(),
+                        position: hover_position,
+                    },
+                )
+                .unwrap();
+        },
+        |event| match event {
+            LspEvent::Response {
+                kind: RequestKind::Definition,
+                result: LspResult::Locations(locations),
+                ..
+            } if !locations.is_empty() => Some(locations.clone()),
+            _ => None,
+        },
+    )
     .expect("definition should resolve");
     assert_eq!(
         std::fs::canonicalize(&locations[0].path).unwrap(),
         std::fs::canonicalize(&main).unwrap()
     );
-    assert_eq!(locations[0].range.start.line, 0, "greet is on the first line");
+    assert_eq!(
+        locations[0].range.start.line, 0,
+        "greet is on the first line"
+    );
 
     // 6. Clean shutdown.
     client.shutdown();

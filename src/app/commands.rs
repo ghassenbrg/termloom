@@ -295,6 +295,7 @@ pub const COMMANDS: &[Command] = &[
     command!("palette.commands", "Command Palette", Workspace, Always),
     command!("palette.quick_open", "Quick Open File", Workspace, Always),
     command!("workspace.reload", "Reload Workspace", Workspace, Always),
+    command!("workspace.run_task", "Run Task…", Workspace, Always),
     command!(
         "workspace.open_config",
         "Open Configuration File",

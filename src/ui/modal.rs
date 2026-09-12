@@ -31,6 +31,31 @@ pub fn draw(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
             " Enter confirm · Esc cancel ".to_string(),
             theme.accent,
         ),
+        Modal::Select {
+            title,
+            options,
+            selected,
+            ..
+        } => (
+            title.clone(),
+            options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let style = if index == *selected {
+                        Style::default()
+                            .fg(theme.text_bright)
+                            .bg(theme.selection)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text)
+                    };
+                    Line::from(Span::styled(format!(" {option}"), style))
+                })
+                .collect(),
+            " ↑↓ select · Enter choose · Esc cancel ".to_string(),
+            theme.accent,
+        ),
         Modal::Message { title, body } => (
             title.clone(),
             body.iter()

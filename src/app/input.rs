@@ -93,7 +93,7 @@ pub fn handle_key(state: &mut AppState, services: &mut Services, key: KeyEvent) 
         FocusTarget::AgentList => handle_agent_key(state, services, key),
         FocusTarget::AgentDetail => handle_agent_detail_key(state, services, key),
         FocusTarget::Problems => handle_problems_key(state, key),
-        FocusTarget::Debug => handle_debug_key(state, key),
+        FocusTarget::Debug => handle_debug_key(state, services, key),
         _ => false,
     };
     if handled {
@@ -161,6 +161,30 @@ fn handle_modal_key(state: &mut AppState, services: &mut Services, key: KeyEvent
                 state.close_modal();
             }
         }
+        Modal::Select {
+            options, purpose, ..
+        } => match key.code {
+            KeyCode::Esc => state.close_modal(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(Modal::Select { selected, .. }) = state.modal.as_mut() {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(Modal::Select { selected, .. }) = state.modal.as_mut() {
+                    *selected = (*selected + 1).min(options.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                let index = match state.modal.as_ref() {
+                    Some(Modal::Select { selected, .. }) => *selected,
+                    _ => 0,
+                };
+                state.close_modal();
+                actions::apply_selection(state, services, purpose, index);
+            }
+            _ => {}
+        },
     }
 }
 
@@ -854,17 +878,23 @@ fn handle_references_key(state: &mut AppState, key: KeyEvent) -> bool {
     }
 }
 
-fn handle_debug_key(state: &mut AppState, key: KeyEvent) -> bool {
+fn handle_debug_key(state: &mut AppState, services: &mut Services, key: KeyEvent) -> bool {
     let len = state.debug.frames.len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
             state.debug.selected_frame = state.debug.selected_frame.saturating_sub(1);
+            select_debug_frame(state, services);
             true
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if len > 0 {
                 state.debug.selected_frame = (state.debug.selected_frame + 1).min(len - 1);
             }
+            select_debug_frame(state, services);
+            true
+        }
+        KeyCode::Enter => {
+            select_debug_frame(state, services);
             true
         }
         KeyCode::Esc => {
@@ -876,6 +906,25 @@ fn handle_debug_key(state: &mut AppState, key: KeyEvent) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Ask the adapter for the selected frame's variables and show its source.
+fn select_debug_frame(state: &mut AppState, services: &mut Services) {
+    let Some(frame) = state.debug.frames.get(state.debug.selected_frame).cloned() else {
+        return;
+    };
+    if let Some(session) = services.debug.as_ref() {
+        let _ = session.send(crate::services::dap::DebugCommand::SelectFrame(frame.id));
+    }
+    let Some(path) = frame.path.clone() else {
+        return;
+    };
+    if let Ok(id) = state.open_file(&path) {
+        let line = frame.line.saturating_sub(1);
+        if let Some(document) = state.document_mut(id) {
+            document.goto(crate::domain::diagnostics::Position::new(line, 0));
+        }
     }
 }
 

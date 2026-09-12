@@ -273,7 +273,10 @@ impl App {
                 tracing::debug!(kind = kind.label(), "empty language server result");
             }
             (kind, _) => {
-                tracing::debug!(kind = kind.label(), "unexpected language server result shape");
+                tracing::debug!(
+                    kind = kind.label(),
+                    "unexpected language server result shape"
+                );
             }
         }
     }
@@ -324,14 +327,21 @@ impl App {
             }
         }
         if changed > 0 {
-            self.state
-                .info(format!("applied language server edits to {changed} file(s)"));
+            self.state.info(format!(
+                "applied language server edits to {changed} file(s)"
+            ));
         }
     }
 
     /// Tell language servers about open documents and buffer changes.
     fn sync_open_documents(&mut self, force_open: bool) {
-        let documents: Vec<(PathBuf, crate::services::syntax::LanguageId, String, i64, i64)> = self
+        let documents: Vec<(
+            PathBuf,
+            crate::services::syntax::LanguageId,
+            String,
+            i64,
+            i64,
+        )> = self
             .state
             .documents
             .iter()
@@ -384,6 +394,104 @@ impl App {
                     tracing::debug!(error = %message, "language server unavailable");
                 }
             }
+        }
+    }
+
+    /// Apply an event from the debug adapter.
+    fn on_debug_event(&mut self, event: crate::services::dap::DebugEvent) {
+        use crate::domain::debug::DebugStatus;
+        use crate::services::dap::DebugEvent;
+
+        match event {
+            DebugEvent::Initialized {
+                adapter,
+                capabilities,
+            } => {
+                self.state.debug.status = DebugStatus::Starting;
+                self.state.debug.adapter = Some(adapter);
+                self.state.debug.capabilities = capabilities;
+            }
+            DebugEvent::Running => {
+                self.state.debug.status = DebugStatus::Running;
+                self.state.debug.frames.clear();
+                self.state.debug.variables.clear();
+                self.state.debug.current_location = None;
+            }
+            DebugEvent::Stopped {
+                reason,
+                thread_id,
+                frames,
+                threads,
+            } => {
+                self.state.debug.status = DebugStatus::Paused;
+                self.state.debug.threads = threads;
+                self.state.debug.selected_frame = 0;
+                self.state.layout.debug = true;
+                let top = frames.first().cloned();
+                self.state.debug.frames = frames;
+                self.state
+                    .info(format!("stopped: {reason} (thread {thread_id})"));
+                if let Some(frame) = top {
+                    self.show_debug_frame(&frame);
+                }
+            }
+            DebugEvent::Variables(variables) => {
+                self.state.debug.variables = variables;
+            }
+            DebugEvent::Output { category, text } => {
+                for line in text.lines() {
+                    self.state.debug.output.push(format!("[{category}] {line}"));
+                }
+                const MAX_OUTPUT: usize = 500;
+                let overflow = self.state.debug.output.len().saturating_sub(MAX_OUTPUT);
+                if overflow > 0 {
+                    self.state.debug.output.drain(..overflow);
+                }
+            }
+            DebugEvent::BreakpointsVerified { path, lines } => {
+                tracing::debug!(path = %path.display(), ?lines, "breakpoints verified");
+            }
+            DebugEvent::Evaluated { expression, value } => {
+                self.state.info(format!("{expression} = {value}"));
+            }
+            DebugEvent::Exited { code } => {
+                self.state.info(format!("debuggee exited with code {code}"));
+            }
+            DebugEvent::Terminated => {
+                self.state.debug.status = DebugStatus::Terminated;
+                self.state.debug.frames.clear();
+                self.state.debug.variables.clear();
+                self.state.debug.current_location = None;
+                self.services.debug = None;
+            }
+            DebugEvent::Failed { message } => {
+                self.state.debug.status = DebugStatus::Failed;
+                self.state.debug.last_error = Some(message.clone());
+                self.state.error(message);
+            }
+        }
+    }
+
+    /// Open the source of a stack frame and mark the execution point.
+    fn show_debug_frame(&mut self, frame: &crate::domain::debug::StackFrame) {
+        let Some(path) = frame.path.clone() else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        match self.state.open_file(&path) {
+            Ok(id) => {
+                let line = frame.line.saturating_sub(1);
+                if let Some(document) = self.state.document_mut(id) {
+                    document.goto(crate::domain::diagnostics::Position::new(
+                        line,
+                        frame.column.saturating_sub(1),
+                    ));
+                }
+                self.state.debug.current_location = Some((path, line));
+            }
+            Err(err) => tracing::debug!(error = %err, "could not open the frame source"),
         }
     }
 
@@ -491,7 +599,10 @@ impl App {
                 self.on_lsp_event(*event);
                 true
             }
-            AppEvent::Debug(_) => true,
+            AppEvent::Debug(event) => {
+                self.on_debug_event(*event);
+                true
+            }
             AppEvent::Notice(notice) => {
                 self.state.notify(notice);
                 true
@@ -797,6 +908,9 @@ impl App {
     fn shutdown(&mut self) {
         self.save_session();
         self.services.lsp.shutdown_all();
+        if let Some(session) = self.services.debug.take() {
+            let _ = session.send(crate::services::dap::DebugCommand::Stop);
+        }
         if let Ok(mut terminals) = self.state.terminals.lock() {
             terminals.shutdown();
         }

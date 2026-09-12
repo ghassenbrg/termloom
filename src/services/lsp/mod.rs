@@ -1,12 +1,12 @@
 //! Language Server Protocol client.
 //!
-//! Layering: [`framing`] speaks the JSON-RPC base protocol, [`protocol`]
+//! Layering: [`crate::services::framing`] speaks the JSON-RPC base protocol,
+//! [`protocol`]
 //! builds payloads and converts results into TermLoom types, [`client`] owns
 //! one server process, and [`manager`] routes documents and requests to the
 //! right client.
 
 pub mod client;
-pub mod framing;
 pub mod manager;
 pub mod protocol;
 

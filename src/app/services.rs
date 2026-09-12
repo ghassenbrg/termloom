@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::services::agents::AgentRegistry;
+use crate::services::dap::DebugSession;
 use crate::services::lsp::LspManager;
 use crate::services::workspace::{FileIndex, ScanOptions};
 
@@ -20,6 +21,8 @@ pub struct Services {
     pub agents: AgentRegistry,
     /// Language servers. Present even when nothing is configured.
     pub lsp: LspManager,
+    /// The current debug session, if one is running.
+    pub debug: Option<DebugSession>,
     /// Set while a git refresh is in flight, so ticks do not pile up.
     git_refreshing: Arc<AtomicBool>,
     /// Set while the quick-open index is being rebuilt.
@@ -27,16 +30,13 @@ pub struct Services {
 }
 
 impl Services {
-    pub fn new(
-        events: EventSender,
-        runtime: tokio::runtime::Runtime,
-        lsp: LspManager,
-    ) -> Services {
+    pub fn new(events: EventSender, runtime: tokio::runtime::Runtime, lsp: LspManager) -> Services {
         Services {
             events,
             runtime,
             agents: AgentRegistry::new(),
             lsp,
+            debug: None,
             git_refreshing: Arc::new(AtomicBool::new(false)),
             indexing: Arc::new(AtomicBool::new(false)),
         }

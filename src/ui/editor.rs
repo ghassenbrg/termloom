@@ -90,8 +90,7 @@ fn draw_completion(
     let width = items
         .iter()
         .map(|item| {
-            item.label.chars().count()
-                + item.kind.as_ref().map(|k| k.len() + 2).unwrap_or(0)
+            item.label.chars().count() + item.kind.as_ref().map(|k| k.len() + 2).unwrap_or(0)
         })
         .max()
         .unwrap_or(20)
@@ -332,8 +331,23 @@ fn draw_buffer(
             ));
         }
 
-        // Marker column: breakpoint wins over diagnostics.
-        let marker = if document.breakpoints.contains(&line_index) {
+        // Marker column: the execution point wins, then breakpoints, then
+        // diagnostics.
+        let stopped_here = state
+            .debug
+            .current_location
+            .as_ref()
+            .is_some_and(|(path, line)| {
+                *line == line_index && document.path.as_deref() == Some(path.as_path())
+            });
+        let marker = if stopped_here {
+            Span::styled(
+                "▶",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if document.breakpoints.contains(&line_index) {
             Span::styled("●", Style::default().fg(theme.danger))
         } else if let Some(diagnostic) = document
             .diagnostics_on(line_index)
@@ -357,7 +371,9 @@ fn draw_buffer(
         ));
 
         let mut line = Line::from(spans);
-        if is_cursor_line && focused {
+        if stopped_here {
+            line = line.style(Style::default().bg(theme.selection));
+        } else if is_cursor_line && focused {
             line = line.style(Style::default().bg(theme.cursor_line));
         }
         lines.push(line);

@@ -92,7 +92,9 @@ impl LspManager {
                 ServerStatus {
                     name: name.clone(),
                     languages: config.languages.clone(),
-                    status: client.map(LspClient::status).unwrap_or(ClientStatus::Exited),
+                    status: client
+                        .map(LspClient::status)
+                        .unwrap_or(ClientStatus::Exited),
                     running: client.is_some(),
                     command: config.command.clone(),
                 }
@@ -242,11 +244,7 @@ impl LspManager {
             RequestKind::Formatting => capabilities.formatting,
         };
         if !supported {
-            return Err(anyhow!(
-                "{} does not support {}",
-                client.name,
-                kind.label()
-            ));
+            return Err(anyhow!("{} does not support {}", client.name, kind.label()));
         }
 
         let (method, params) = match (kind, &extra) {
@@ -270,10 +268,9 @@ impl LspManager {
                 "textDocument/documentSymbol",
                 serde_json::json!({ "textDocument": { "uri": protocol::path_to_uri(path) } }),
             ),
-            (RequestKind::WorkspaceSymbols, RequestExtra::Query(query)) => (
-                "workspace/symbol",
-                serde_json::json!({ "query": query }),
-            ),
+            (RequestKind::WorkspaceSymbols, RequestExtra::Query(query)) => {
+                ("workspace/symbol", serde_json::json!({ "query": query }))
+            }
             (RequestKind::WorkspaceSymbols, _) => {
                 ("workspace/symbol", serde_json::json!({ "query": "" }))
             }

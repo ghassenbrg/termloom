@@ -160,13 +160,18 @@ pub fn draw_status(
     let running: Vec<&str> = state
         .lsp_statuses
         .iter()
-        .filter(|server| server.running && server.status == crate::services::lsp::ClientStatus::Ready)
+        .filter(|server| {
+            server.running && server.status == crate::services::lsp::ClientStatus::Ready
+        })
         .map(|server| server.name.as_str())
         .collect();
     if !state.lsp_statuses.is_empty() {
         left.push(Span::styled("│ ", Style::default().fg(theme.border)));
         if running.is_empty() {
-            left.push(Span::styled("LSP off ", Style::default().fg(theme.text_dim)));
+            left.push(Span::styled(
+                "LSP off ",
+                Style::default().fg(theme.text_dim),
+            ));
         } else {
             left.push(Span::styled(
                 format!("LSP {} ✓ ", running.join(",")),

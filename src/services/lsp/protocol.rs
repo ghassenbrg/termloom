@@ -41,10 +41,9 @@ impl ServerCapabilities {
         };
         let sync = match &capabilities["textDocumentSync"] {
             Value::Number(n) => n.as_u64().unwrap_or(0) as u8,
-            Value::Object(object) => object
-                .get("change")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u8,
+            Value::Object(object) => {
+                object.get("change").and_then(Value::as_u64).unwrap_or(0) as u8
+            }
             _ => 0,
         };
         ServerCapabilities {
@@ -222,7 +221,10 @@ fn parse_position(value: &Value) -> Position {
 }
 
 pub fn parse_range(value: &Value) -> Range {
-    Range::new(parse_position(&value["start"]), parse_position(&value["end"]))
+    Range::new(
+        parse_position(&value["start"]),
+        parse_position(&value["end"]),
+    )
 }
 
 /// Convert a `textDocument/publishDiagnostics` notification.
@@ -292,7 +294,11 @@ pub fn parse_hover(result: &Value) -> Vec<String> {
     }
     let contents = &result["contents"];
     let raw = match contents {
-        Value::Array(items) => items.iter().filter_map(text_of).collect::<Vec<_>>().join("\n"),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(text_of)
+            .collect::<Vec<_>>()
+            .join("\n"),
         other => text_of(other).unwrap_or_default(),
     };
     raw.lines()
@@ -312,9 +318,31 @@ pub struct CompletionItem {
 }
 
 const COMPLETION_KINDS: &[&str] = &[
-    "", "text", "method", "function", "constructor", "field", "variable", "class", "interface",
-    "module", "property", "unit", "value", "enum", "keyword", "snippet", "color", "file",
-    "reference", "folder", "enum member", "constant", "struct", "event", "operator",
+    "",
+    "text",
+    "method",
+    "function",
+    "constructor",
+    "field",
+    "variable",
+    "class",
+    "interface",
+    "module",
+    "property",
+    "unit",
+    "value",
+    "enum",
+    "keyword",
+    "snippet",
+    "color",
+    "file",
+    "reference",
+    "folder",
+    "enum member",
+    "constant",
+    "struct",
+    "event",
+    "operator",
     "type parameter",
 ];
 
@@ -375,7 +403,12 @@ pub fn parse_symbols(result: &Value) -> Vec<Symbol> {
     out
 }
 
-fn push_document_symbol(item: &Value, depth: usize, container: Option<String>, out: &mut Vec<Symbol>) {
+fn push_document_symbol(
+    item: &Value,
+    depth: usize,
+    container: Option<String>,
+    out: &mut Vec<Symbol>,
+) {
     let name = item["name"].as_str().unwrap_or_default().to_string();
     let range = if item.get("selectionRange").is_some() {
         parse_range(&item["selectionRange"])
@@ -603,7 +636,10 @@ mod tests {
                 }]
             }]
         });
-        assert_eq!(parse_workspace_edit(&document_changes)[0].0, PathBuf::from("/b.rs"));
+        assert_eq!(
+            parse_workspace_edit(&document_changes)[0].0,
+            PathBuf::from("/b.rs")
+        );
     }
 
     #[test]

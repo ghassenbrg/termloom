@@ -265,7 +265,9 @@ fn draw_sidebar(
         constraints.push(Constraint::Length((area.height / 3).max(6)));
     }
     if show_lsp {
-        constraints.push(Constraint::Length((state.lsp_statuses.len() as u16).clamp(2, 4) + 2));
+        constraints.push(Constraint::Length(
+            (state.lsp_statuses.len() as u16).clamp(2, 4) + 2,
+        ));
     }
 
     let rows = Layout::default()

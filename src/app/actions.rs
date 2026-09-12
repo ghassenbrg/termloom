@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::agent::{AgentKind, AgentState};
 use crate::domain::diagnostics::Position;
 use crate::services::agents::{local::request_from_preset, SpawnAgentRequest};
+use crate::services::dap::{self, DebugCommand, DebugSession};
 use crate::services::lsp::{RequestExtra, RequestKind};
 use crate::services::terminal::SpawnSpec;
 use crate::services::workspace::ScanOptions;
@@ -17,7 +18,9 @@ use crate::services::{fs_ops, git};
 use super::events::Notice;
 use super::focus::{Direction, FocusTarget};
 use super::services::Services;
-use super::state::{AgentDetailTab, AppState, ConfirmAction, PaletteMode, PromptPurpose};
+use super::state::{
+    AgentDetailTab, AppState, ConfirmAction, PaletteMode, PromptPurpose, SelectPurpose,
+};
 
 /// Run a command by id. Unknown ids are reported rather than ignored.
 pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
@@ -312,6 +315,32 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
         "app.quit" => quit(state),
         "workbench.prefix" => state.prefix_active = true,
 
+        // ── debugging ─────────────────────────────────────────────────────
+        "debug.start" => start_debugging(state, services),
+        "debug.stop" => debug_command(state, services, DebugCommand::Stop),
+        "debug.continue" => debug_command(state, services, DebugCommand::Continue),
+        "debug.pause" => debug_command(state, services, DebugCommand::Pause),
+        "debug.step_over" => debug_command(state, services, DebugCommand::StepOver),
+        "debug.step_in" => debug_command(state, services, DebugCommand::StepIn),
+        "debug.step_out" => debug_command(state, services, DebugCommand::StepOut),
+        "debug.toggle_breakpoint" => toggle_breakpoint(state, services),
+        "debug.clear_breakpoints" => {
+            let paths: Vec<PathBuf> = state
+                .documents
+                .iter()
+                .filter(|d| !d.breakpoints.is_empty())
+                .filter_map(|d| d.path.clone())
+                .collect();
+            for document in &mut state.documents {
+                document.breakpoints.clear();
+            }
+            for path in paths {
+                sync_breakpoints(state, services, &path);
+            }
+            state.info("all breakpoints removed");
+        }
+        "workspace.run_task" => run_task(state),
+
         // ── language services ─────────────────────────────────────────────
         "lsp.start" => start_language_server(state, services),
         "lsp.restart" => restart_language_server(state, services),
@@ -360,6 +389,201 @@ pub fn execute(state: &mut AppState, services: &mut Services, id: &str) {
 
         // ── not yet connected to a running service ────────────────────────
         other => unavailable(state, other),
+    }
+}
+
+// ── debugging ─────────────────────────────────────────────────────────────
+
+/// Offer the available launch configurations, then ask for consent.
+fn start_debugging(state: &mut AppState, services: &mut Services) {
+    if services.debug.is_some() {
+        state.warn("a debug session is already running");
+        return;
+    }
+    let entries = dap::available(&state.config, &state.workspace.root);
+    if entries.is_empty() {
+        state.error(
+            "no debug configuration found — add one under [dap] in config.toml or a .vscode/launch.json",
+        );
+        return;
+    }
+    if entries.len() == 1 {
+        confirm_debug_start(state, entries[0].clone());
+        return;
+    }
+    let options = entries
+        .iter()
+        .map(|entry| format!("{}  ({})", entry.name, entry.source.label()))
+        .collect();
+    state.select(
+        "Start debugging",
+        options,
+        SelectPurpose::DebugConfiguration(entries),
+    );
+}
+
+/// Show the exact adapter command before anything is executed.
+fn confirm_debug_start(state: &mut AppState, entry: dap::LaunchEntry) {
+    let breakpoints = collect_breakpoints(state);
+    match dap::resolve(&state.config, &state.workspace.root, &entry, breakpoints) {
+        Ok(config) => {
+            let unresolved = dap::config::unresolved_variables(&config.arguments);
+            if !unresolved.is_empty() {
+                state.warn(format!(
+                    "unsupported launch variables left as-is: {}",
+                    unresolved.join(", ")
+                ));
+            }
+            state.confirm(
+                "Run debug adapter",
+                format!(
+                    "{} will run:\n\n{}\n\nin {}",
+                    config.name,
+                    config.command_line(),
+                    config.cwd.display()
+                ),
+                ConfirmAction::StartDebugSession(Box::new(config)),
+            );
+        }
+        Err(err) => state.error(format!("{err:#}")),
+    }
+}
+
+/// Breakpoints across all open documents, keyed by file.
+fn collect_breakpoints(state: &AppState) -> std::collections::HashMap<PathBuf, Vec<usize>> {
+    let mut out = std::collections::HashMap::new();
+    for document in &state.documents {
+        if document.breakpoints.is_empty() {
+            continue;
+        }
+        if let Some(path) = &document.path {
+            out.insert(
+                path.clone(),
+                document.breakpoints.iter().copied().collect::<Vec<_>>(),
+            );
+        }
+    }
+    out
+}
+
+/// Launch the adapter the user approved.
+pub fn launch_debug_session(
+    state: &mut AppState,
+    services: &mut Services,
+    config: dap::DebugLaunchConfig,
+) {
+    let sender = services.events.clone();
+    let sink: crate::services::dap::DebugSink = std::sync::Arc::new(move |event| {
+        let _ = sender.send(crate::app::events::AppEvent::Debug(Box::new(event)));
+    });
+    match DebugSession::start(config, sink) {
+        Ok(session) => {
+            state.debug = crate::app::state::DebugUiState {
+                status: crate::domain::debug::DebugStatus::Starting,
+                adapter: Some(session.command_line.clone()),
+                ..Default::default()
+            };
+            state.layout.debug = true;
+            services.debug = Some(session);
+            state.info("debug session starting");
+        }
+        Err(err) => {
+            state.debug.last_error = Some(format!("{err:#}"));
+            state.error(format!("could not start the debug adapter: {err:#}"));
+        }
+    }
+}
+
+fn debug_command(state: &mut AppState, services: &mut Services, command: DebugCommand) {
+    let Some(session) = services.debug.as_ref() else {
+        state.warn("no debug session is running");
+        return;
+    };
+    let stopping = command == DebugCommand::Stop;
+    if let Err(err) = session.send(command) {
+        state.warn(format!("{err:#}"));
+    }
+    if stopping {
+        services.debug = None;
+        state.debug.status = crate::domain::debug::DebugStatus::Terminated;
+    }
+}
+
+fn toggle_breakpoint(state: &mut AppState, services: &mut Services) {
+    let Some(document) = state.active_document_mut() else {
+        state.warn("open a file first");
+        return;
+    };
+    let line = document.buffer.cursor().line;
+    let enabled = document.toggle_breakpoint(line);
+    let path = document.path.clone();
+    if let Some(path) = path {
+        sync_breakpoints(state, services, &path);
+        state.info(format!(
+            "breakpoint {} at line {}",
+            if enabled { "set" } else { "cleared" },
+            line + 1
+        ));
+    }
+}
+
+/// Push a file's breakpoints to a running adapter.
+fn sync_breakpoints(state: &mut AppState, services: &mut Services, path: &Path) {
+    let Some(session) = services.debug.as_ref() else {
+        return;
+    };
+    let lines = state
+        .document_for_path(path)
+        .map(|document| document.breakpoints.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Err(err) = session.send(DebugCommand::SetBreakpoints(path.to_path_buf(), lines)) {
+        tracing::debug!(error = %err, "could not update breakpoints");
+    }
+}
+
+/// Offer the repository's tasks; running one is always explicit.
+fn run_task(state: &mut AppState) {
+    let tasks = crate::services::vscode::read_tasks(&state.workspace.root);
+    if tasks.is_empty() {
+        state.info("no tasks defined in .vscode/tasks.json");
+        return;
+    }
+    let options = tasks
+        .iter()
+        .map(|task| format!("{}  ({})", task.label, task.command_line()))
+        .collect();
+    state.select("Run task", options, SelectPurpose::Task(tasks));
+}
+
+/// Start a task in a new terminal after the user confirmed it.
+pub fn start_task(state: &mut AppState, task: &crate::services::vscode::VsCodeTask) {
+    let cwd = task
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.root.clone());
+    let (rows, cols) = state.terminal_pane_size;
+    let result = {
+        let Ok(mut terminals) = state.terminals.lock() else {
+            return;
+        };
+        let mut spec = crate::services::terminal::SpawnSpec::shell(
+            task.label.clone(),
+            &task.command,
+            &task.args,
+            &cwd,
+        );
+        spec.kind = crate::domain::terminal::TerminalKind::Task;
+        spec.rows = rows;
+        spec.cols = cols;
+        terminals.spawn(spec)
+    };
+    match result {
+        Ok(id) => {
+            state.layout.terminals = true;
+            state.focus_terminal(id);
+        }
+        Err(err) => state.error(format!("could not run {}: {err:#}", task.label)),
     }
 }
 
@@ -449,9 +673,6 @@ fn unavailable(state: &mut AppState, id: &str) {
         id if id.starts_with("lsp.") => {
             "no language server is running for this file (configure one under [lsp] in config.toml)"
                 .to_string()
-        }
-        id if id.starts_with("debug.") => {
-            "no debug adapter is configured (add one under [dap] in config.toml)".to_string()
         }
         id if id.starts_with("extensions.") => {
             "use `termloom extension install <file.vsix>` to add a package".to_string()
@@ -976,8 +1197,41 @@ pub fn apply_confirm(state: &mut AppState, services: &mut Services, action: Conf
                 "use `termloom extension remove {id}` to remove this package"
             ));
         }
+        ConfirmAction::StartDebugSession(config) => {
+            launch_debug_session(state, services, *config);
+        }
+        ConfirmAction::RunTask(task) => start_task(state, &task),
         ConfirmAction::QuitWithUnsavedChanges => state.should_quit = true,
     }
+}
+
+/// Apply a choice from a selection dialog.
+pub fn apply_selection(
+    state: &mut AppState,
+    services: &mut Services,
+    purpose: SelectPurpose,
+    index: usize,
+) {
+    match purpose {
+        SelectPurpose::DebugConfiguration(entries) => {
+            let Some(entry) = entries.get(index).cloned() else {
+                return;
+            };
+            confirm_debug_start(state, entry);
+        }
+        SelectPurpose::Task(tasks) => {
+            let Some(task) = tasks.get(index).cloned() else {
+                return;
+            };
+            // Repository-defined commands always need explicit approval.
+            state.confirm(
+                "Run task",
+                format!("Run `{}` in a new terminal?", task.command_line()),
+                ConfirmAction::RunTask(task),
+            );
+        }
+    }
+    let _ = services;
 }
 
 /// Apply a prompt result.

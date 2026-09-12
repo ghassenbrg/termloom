@@ -30,30 +30,31 @@ impl WorkspaceWatcher {
         on_change: impl Fn(Vec<PathBuf>) + Send + 'static,
     ) -> Result<WorkspaceWatcher> {
         let ignore_for_filter = ignore.clone();
-        let mut debouncer = new_debouncer(
-            DEBOUNCE,
-            None,
-            move |result: DebounceEventResult| match result {
-                Ok(events) => {
-                    let mut paths: Vec<PathBuf> = events
-                        .into_iter()
-                        .flat_map(|event| event.paths.clone())
-                        .filter(|path| !is_ignored(path, &ignore_for_filter))
-                        .collect();
-                    paths.sort();
-                    paths.dedup();
-                    if !paths.is_empty() {
-                        on_change(paths);
+        let mut debouncer =
+            new_debouncer(
+                DEBOUNCE,
+                None,
+                move |result: DebounceEventResult| match result {
+                    Ok(events) => {
+                        let mut paths: Vec<PathBuf> = events
+                            .into_iter()
+                            .flat_map(|event| event.paths.clone())
+                            .filter(|path| !is_ignored(path, &ignore_for_filter))
+                            .collect();
+                        paths.sort();
+                        paths.dedup();
+                        if !paths.is_empty() {
+                            on_change(paths);
+                        }
                     }
-                }
-                Err(errors) => {
-                    for error in errors {
-                        tracing::debug!(error = %error, "filesystem watch error");
+                    Err(errors) => {
+                        for error in errors {
+                            tracing::debug!(error = %error, "filesystem watch error");
+                        }
                     }
-                }
-            },
-        )
-        .context("starting the filesystem watcher")?;
+                },
+            )
+            .context("starting the filesystem watcher")?;
 
         debouncer
             .watch(root, RecursiveMode::Recursive)

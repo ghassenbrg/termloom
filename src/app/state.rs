@@ -571,7 +571,7 @@ impl AppState {
     /// Paths are canonicalised first: language servers and git report resolved
     /// paths, and without this the same file could end up in two tabs.
     pub fn open_file(&mut self, path: &Path) -> Result<EditorTabId> {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = canonical_path(path);
         let path = canonical.as_path();
         if let Some(existing) = self.document_for_path(path).map(|d| d.id) {
             self.activate_tab(existing);
@@ -784,7 +784,19 @@ impl AppState {
     }
 
     /// Replace the diagnostics of one file, keeping the rest.
+    ///
+    /// The path is canonicalised first: language servers report resolved
+    /// paths, and on macOS `/var` and `/private/var` name the same file.
     pub fn set_diagnostics(&mut self, path: &Path, diagnostics: Vec<Diagnostic>) {
+        let canonical = canonical_path(path);
+        let path = canonical.as_path();
+        let diagnostics: Vec<Diagnostic> = diagnostics
+            .into_iter()
+            .map(|mut diagnostic| {
+                diagnostic.path = canonical.clone();
+                diagnostic
+            })
+            .collect();
         self.problems.retain(|d| d.path != path);
         self.problems.extend(diagnostics.iter().cloned());
         self.problems.sort_by(|a, b| {
@@ -1030,7 +1042,10 @@ impl AppState {
 
     /// Select a path in the tree, expanding ancestors as needed.
     pub fn reveal_in_explorer(&mut self, path: &Path) {
-        self.tree.reveal(path);
+        // The tree stores canonical paths (the workspace root is resolved on
+        // open), so callers may pass either form.
+        let path = canonical_path(path);
+        self.tree.reveal(&path);
         if let Some(index) = self.tree.rows().iter().position(|row| row.path == path) {
             self.explorer.selected = index;
         }
@@ -1050,6 +1065,11 @@ impl AppState {
     }
 }
 
+/// Resolve a path, falling back to the input when it does not exist yet.
+pub fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolve a path against the workspace, rejecting escapes outside it.
 ///
 /// Used by every filesystem mutation so a crafted name cannot write outside
@@ -1066,4 +1086,367 @@ pub fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
         return Err(anyhow!("`..` is not allowed in a name"));
     }
     Ok(root.join(candidate))
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use crate::config::Config;
+    use crate::services::terminal::{EventSink, TerminalManager};
+    use crate::services::workspace::Workspace;
+
+    use super::AppState;
+
+    /// A workspace on disk plus the state that opens it.
+    pub struct TestWorkspace {
+        pub dir: tempfile::TempDir,
+        pub state: AppState,
+        pub terminals: Arc<Mutex<TerminalManager>>,
+    }
+
+    /// Build a small project and an `AppState` over it.
+    pub fn workspace() -> TestWorkspace {
+        workspace_with(Config::with_builtin_defaults())
+    }
+
+    pub fn workspace_with(config: Config) -> TestWorkspace {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {\n    let a = 1;\n}\n").unwrap();
+        std::fs::write(root.join("src/app/mod.rs"), "pub struct App;\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+
+        let sink: EventSink = Arc::new(|_| {});
+        let terminals = Arc::new(Mutex::new(TerminalManager::new(sink)));
+        let (workspace, _) = Workspace::discover(root).unwrap();
+        let state = AppState::new(workspace, config, Vec::new(), Arc::clone(&terminals));
+        TestWorkspace {
+            dir,
+            state,
+            terminals,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::workspace;
+    use super::*;
+    use crate::app::commands::{Category, Command, Requirement};
+    use crate::domain::diagnostics::{Diagnostic, Range};
+
+    fn command(requires: Requirement) -> Command {
+        Command {
+            id: "test.command",
+            title: "Test",
+            category: Category::File,
+            requires,
+        }
+    }
+
+    #[test]
+    fn opening_the_same_file_twice_reuses_its_tab() {
+        let mut fixture = workspace();
+        let path = fixture.dir.path().join("src/main.rs");
+        let first = fixture.state.open_file(&path).unwrap();
+        let second = fixture.state.open_file(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fixture.state.documents.len(), 1);
+        assert_eq!(fixture.state.active_tab, Some(first));
+        assert!(fixture.state.focus.is_editor());
+    }
+
+    #[test]
+    fn opening_a_missing_file_is_an_error_and_changes_nothing() {
+        let mut fixture = workspace();
+        assert!(fixture
+            .state
+            .open_file(&fixture.dir.path().join("nope.rs"))
+            .is_err());
+        assert!(fixture.state.documents.is_empty());
+    }
+
+    #[test]
+    fn dirty_tabs_refuse_to_close_until_forced() {
+        let mut fixture = workspace();
+        let path = fixture.dir.path().join("src/main.rs");
+        let id = fixture.state.open_file(&path).unwrap();
+        fixture.state.document_mut(id).unwrap().buffer.insert("x");
+
+        assert!(
+            !fixture.state.close_tab(id, false),
+            "dirty tab must be kept"
+        );
+        assert_eq!(fixture.state.documents.len(), 1);
+        assert!(fixture.state.close_tab(id, true));
+        assert!(fixture.state.documents.is_empty());
+        assert_eq!(fixture.state.active_tab, None);
+        assert_eq!(fixture.state.focus, FocusTarget::Explorer);
+    }
+
+    #[test]
+    fn closing_a_tab_records_it_for_reopening_and_activates_a_neighbour() {
+        let mut fixture = workspace();
+        let first = fixture
+            .state
+            .open_file(&fixture.dir.path().join("src/main.rs"))
+            .unwrap();
+        let second = fixture
+            .state
+            .open_file(&fixture.dir.path().join("README.md"))
+            .unwrap();
+        assert_eq!(fixture.state.active_tab, Some(second));
+
+        assert!(fixture.state.close_tab(second, false));
+        assert_eq!(fixture.state.active_tab, Some(first));
+        assert_eq!(
+            fixture.state.recently_closed.back().unwrap().file_name(),
+            Some(std::ffi::OsStr::new("README.md"))
+        );
+    }
+
+    #[test]
+    fn tab_cycling_wraps_in_both_directions() {
+        let mut fixture = workspace();
+        let first = fixture
+            .state
+            .open_file(&fixture.dir.path().join("src/main.rs"))
+            .unwrap();
+        let second = fixture
+            .state
+            .open_file(&fixture.dir.path().join("README.md"))
+            .unwrap();
+
+        fixture.state.next_tab(1);
+        assert_eq!(fixture.state.active_tab, Some(first), "wrapped forward");
+        fixture.state.next_tab(-1);
+        assert_eq!(fixture.state.active_tab, Some(second), "wrapped backward");
+    }
+
+    #[test]
+    fn syntax_and_outline_are_recomputed_only_when_the_buffer_changes() {
+        let mut fixture = workspace();
+        let id = fixture
+            .state
+            .open_file(&fixture.dir.path().join("src/main.rs"))
+            .unwrap();
+        fixture.state.refresh_syntax();
+
+        let document = fixture.state.document(id).unwrap();
+        assert!(document.syntax.is_some(), "rust should be highlighted");
+        assert!(!document.symbols.is_empty(), "outline should be filled");
+        let version = document.syntax_version;
+
+        fixture.state.refresh_syntax();
+        assert_eq!(
+            fixture.state.document(id).unwrap().syntax_version,
+            version,
+            "an unchanged buffer must not be re-parsed"
+        );
+
+        fixture
+            .state
+            .document_mut(id)
+            .unwrap()
+            .buffer
+            .insert("// note\n");
+        fixture.state.refresh_syntax();
+        assert!(fixture.state.document(id).unwrap().syntax_version > version);
+    }
+
+    #[test]
+    fn diagnostics_replace_per_file_and_reach_the_document() {
+        let mut fixture = workspace();
+        let path = fixture.dir.path().join("src/main.rs");
+        let id = fixture.state.open_file(&path).unwrap();
+        let other = fixture.dir.path().join("README.md");
+
+        let diagnostic = |path: &std::path::Path, severity| Diagnostic {
+            path: path.to_path_buf(),
+            range: Range::single_line(0, 0, 1),
+            severity,
+            message: "boom".into(),
+            source: None,
+            code: None,
+        };
+
+        fixture
+            .state
+            .set_diagnostics(&path, vec![diagnostic(&path, Severity::Error)]);
+        fixture
+            .state
+            .set_diagnostics(&other, vec![diagnostic(&other, Severity::Warning)]);
+        assert_eq!(fixture.state.problem_counts(), (1, 1));
+        assert_eq!(fixture.state.document(id).unwrap().diagnostics.len(), 1);
+
+        // A fresh publication for one file replaces only that file's entries.
+        fixture.state.set_diagnostics(&path, Vec::new());
+        assert_eq!(fixture.state.problem_counts(), (0, 1));
+        assert!(fixture.state.document(id).unwrap().diagnostics.is_empty());
+    }
+
+    #[test]
+    fn command_availability_follows_the_workbench_state() {
+        let mut fixture = workspace();
+        assert!(fixture.state.is_available(&command(Requirement::Always)));
+        assert!(!fixture
+            .state
+            .is_available(&command(Requirement::ActiveEditor)));
+
+        let id = fixture
+            .state
+            .open_file(&fixture.dir.path().join("src/main.rs"))
+            .unwrap();
+        assert!(fixture
+            .state
+            .is_available(&command(Requirement::ActiveEditor)));
+        assert!(!fixture
+            .state
+            .is_available(&command(Requirement::DirtyEditor)));
+
+        fixture.state.document_mut(id).unwrap().buffer.insert("x");
+        assert!(fixture
+            .state
+            .is_available(&command(Requirement::DirtyEditor)));
+
+        // Services that are not running gate their commands.
+        assert!(!fixture
+            .state
+            .is_available(&command(Requirement::LanguageServer)));
+        assert!(!fixture
+            .state
+            .is_available(&command(Requirement::DebugSession)));
+        assert!(!fixture
+            .state
+            .is_available(&command(Requirement::ActiveTerminal)));
+    }
+
+    #[test]
+    fn focus_moves_between_visible_regions_only() {
+        let mut fixture = workspace();
+        fixture
+            .state
+            .open_file(&fixture.dir.path().join("src/main.rs"))
+            .unwrap();
+
+        fixture.state.focus = FocusTarget::Explorer;
+        fixture.state.move_focus(Direction::Right);
+        assert!(fixture.state.focus.is_editor());
+
+        fixture.state.move_focus(Direction::Right);
+        assert_eq!(fixture.state.focus, FocusTarget::AgentList);
+
+        // Hiding the agents panel removes it from the rotation.
+        fixture.state.focus = FocusTarget::Editor(fixture.state.active_tab.unwrap());
+        fixture.state.layout.agents = false;
+        fixture.state.move_focus(Direction::Right);
+        assert!(fixture.state.focus.is_editor(), "nowhere to go");
+    }
+
+    #[test]
+    fn the_palette_lists_only_runnable_commands() {
+        let mut fixture = workspace();
+        fixture.state.open_palette(PaletteMode::Commands);
+        assert_eq!(fixture.state.focus, FocusTarget::CommandPalette);
+
+        let mut palette = fixture.state.palette.take().unwrap();
+        palette.query = "save".into();
+        fixture.state.refresh_palette_items(&mut palette);
+        let ids: Vec<&str> = palette
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PaletteItem::Command(command) => Some(command.id),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&"file.save_all"), "{ids:?}");
+        assert!(
+            !ids.contains(&"file.save"),
+            "save needs a dirty editor: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn quick_open_ranks_indexed_files() {
+        let mut fixture = workspace();
+        fixture.state.file_index = crate::services::workspace::FileIndex {
+            files: vec![
+                PathBuf::from("src/main.rs"),
+                PathBuf::from("src/app/mod.rs"),
+                PathBuf::from("README.md"),
+            ],
+            truncated: false,
+        };
+        fixture.state.open_palette(PaletteMode::Files);
+        let mut palette = fixture.state.palette.take().unwrap();
+        palette.query = "mainrs".into();
+        fixture.state.refresh_palette_items(&mut palette);
+        match &palette.items[0] {
+            PaletteItem::File(path) => assert_eq!(path, &PathBuf::from("src/main.rs")),
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toasts_expire() {
+        let mut fixture = workspace();
+        fixture.state.info("hello");
+        assert_eq!(fixture.state.toasts.len(), 1);
+        fixture
+            .state
+            .expire_toasts(std::time::Duration::from_secs(60));
+        assert_eq!(fixture.state.toasts.len(), 1);
+        fixture.state.expire_toasts(std::time::Duration::ZERO);
+        assert!(fixture.state.toasts.is_empty());
+    }
+
+    #[test]
+    fn revealing_a_file_expands_and_selects_it() {
+        let mut fixture = workspace();
+        // Deliberately pass the uncanonicalised path a caller might hold.
+        let path = fixture.dir.path().join("src/app/mod.rs");
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        fixture.state.reveal_in_explorer(&path);
+        assert_eq!(
+            fixture.state.explorer_selection().as_deref(),
+            Some(canonical.as_path())
+        );
+        // The directory that holds it becomes the target for new files.
+        assert_eq!(
+            fixture.state.explorer_target_dir(),
+            canonical.parent().unwrap()
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_escapes() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            safe_join(root, "notes.txt").unwrap(),
+            root.join("notes.txt")
+        );
+        assert!(safe_join(root, "../escape").is_err());
+        assert!(safe_join(root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn terminal_focus_falls_back_when_a_session_disappears() {
+        let mut fixture = workspace();
+        let id = {
+            let mut terminals = fixture.terminals.lock().unwrap();
+            terminals
+                .spawn_shell("cat", &[], fixture.dir.path())
+                .unwrap()
+        };
+        fixture.state.focus_terminal(id);
+        assert_eq!(fixture.state.focus, FocusTarget::Terminal(id));
+
+        fixture.terminals.lock().unwrap().close(id);
+        fixture.state.reconcile_terminal_focus();
+        assert_eq!(fixture.state.focused_terminal, None);
+        assert!(!fixture.state.focus.is_terminal());
+    }
 }

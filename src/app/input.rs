@@ -1091,3 +1091,445 @@ fn scroll_at(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyEventKind, KeyEventState, MouseButton, MouseEventKind};
+
+    use crate::app::services::TestServices;
+    use crate::app::state::test_support::{workspace, TestWorkspace};
+    use crate::config::Config;
+    use crate::ui::WorkbenchLayout;
+
+    use super::*;
+
+    /// A workspace plus the services commands need.
+    struct Harness {
+        fixture: TestWorkspace,
+        services: TestServices,
+    }
+
+    fn harness() -> Harness {
+        let fixture = workspace();
+        let services = crate::app::services::Services::for_test(
+            &Config::with_builtin_defaults(),
+            fixture.dir.path(),
+        );
+        Harness { fixture, services }
+    }
+
+    impl Harness {
+        fn press(&mut self, code: KeyCode) {
+            self.press_with(code, KeyModifiers::NONE);
+        }
+
+        fn press_with(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+            let key = KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            };
+            handle_key(&mut self.fixture.state, &mut self.services.services, key);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                self.press(KeyCode::Char(c));
+            }
+        }
+
+        /// Enter the command prefix, then a key.
+        fn prefix(&mut self, code: KeyCode) {
+            self.press_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
+            assert!(self.fixture.state.prefix_active, "prefix should be armed");
+            self.press(code);
+        }
+
+        fn open_main(&mut self) {
+            let path = self.fixture.dir.path().join("src/main.rs");
+            self.fixture.state.open_file(&path).unwrap();
+        }
+
+        fn state(&mut self) -> &mut AppState {
+            &mut self.fixture.state
+        }
+    }
+
+    #[test]
+    fn the_prefix_runs_workbench_commands() {
+        let mut harness = harness();
+        harness.prefix(KeyCode::Char('e'));
+        assert_eq!(harness.state().focus, FocusTarget::Explorer);
+        assert!(!harness.state().prefix_active, "the prefix is consumed");
+
+        harness.prefix(KeyCode::Char('a'));
+        assert_eq!(harness.state().focus, FocusTarget::AgentList);
+    }
+
+    #[test]
+    fn an_unbound_prefix_key_reports_instead_of_acting() {
+        let mut harness = harness();
+        let before = harness.state().focus;
+        harness.prefix(KeyCode::Char('§'));
+        assert_eq!(harness.state().focus, before);
+        assert!(
+            harness
+                .state()
+                .toasts
+                .iter()
+                .any(|toast| toast.text.contains("no command bound")),
+            "the user should be told nothing happened"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_prefix() {
+        let mut harness = harness();
+        harness.press_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        harness.press(KeyCode::Esc);
+        assert!(!harness.state().prefix_active);
+        assert!(harness.state().toasts.is_empty());
+    }
+
+    #[test]
+    fn typing_in_the_editor_edits_the_buffer() {
+        let mut harness = harness();
+        harness.open_main();
+        harness.state().focus = FocusTarget::Editor(harness.state().active_tab.unwrap());
+        harness.press_with(KeyCode::Home, KeyModifiers::CONTROL);
+        harness.type_text("// ");
+
+        let document = harness.state().active_document().unwrap();
+        assert!(document.buffer.line(0).starts_with("// fn main"));
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn editor_navigation_and_selection_keys_work() {
+        let mut harness = harness();
+        harness.open_main();
+        harness.state().focus = FocusTarget::Editor(harness.state().active_tab.unwrap());
+
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::End);
+        assert_eq!(
+            harness
+                .state()
+                .active_document()
+                .unwrap()
+                .buffer
+                .cursor()
+                .line,
+            1
+        );
+
+        harness.press_with(KeyCode::Home, KeyModifiers::SHIFT);
+        assert!(
+            harness
+                .state()
+                .active_document()
+                .unwrap()
+                .buffer
+                .has_selection(),
+            "Shift+Home should select to the line start"
+        );
+
+        harness.press(KeyCode::Esc);
+        assert!(!harness
+            .state()
+            .active_document()
+            .unwrap()
+            .buffer
+            .has_selection());
+    }
+
+    #[test]
+    fn ctrl_s_saves_the_active_editor() {
+        let mut harness = harness();
+        harness.open_main();
+        harness.state().focus = FocusTarget::Editor(harness.state().active_tab.unwrap());
+        harness.type_text("x");
+        assert!(harness.state().active_document().unwrap().is_dirty());
+
+        harness.press_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!harness.state().active_document().unwrap().is_dirty());
+        let saved =
+            std::fs::read_to_string(harness.fixture.dir.path().join("src/main.rs")).unwrap();
+        assert!(saved.starts_with('x'), "{saved}");
+    }
+
+    #[test]
+    fn explorer_keys_navigate_expand_and_open() {
+        let mut harness = harness();
+        harness.state().focus = FocusTarget::Explorer;
+
+        // Rows: src/ then README.md. Enter expands the directory.
+        harness.press(KeyCode::Enter);
+        let names: Vec<String> = harness
+            .state()
+            .tree
+            .rows()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert!(names.contains(&"main.rs".to_string()), "{names:?}");
+
+        // Move onto a file and open it.
+        harness.press(KeyCode::Char('j'));
+        harness.press(KeyCode::Char('j'));
+        harness.press(KeyCode::Enter);
+        assert!(
+            harness.state().active_document().is_some(),
+            "a file should have opened"
+        );
+        assert!(harness.state().focus.is_editor());
+    }
+
+    #[test]
+    fn the_palette_filters_and_runs_a_command() {
+        let mut harness = harness();
+        harness.press_with(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(harness.state().focus, FocusTarget::CommandPalette);
+
+        // Ctrl+P is quick open; Tab switches to commands.
+        harness.press(KeyCode::Tab);
+        harness.type_text("toggle agents");
+        let selected = harness.state().palette_selection();
+        assert!(
+            matches!(&selected, Some(PaletteItem::Command(command)) if command.id == "view.toggle.agents"),
+            "unexpected selection: {selected:?}"
+        );
+
+        let before = harness.state().layout.agents;
+        harness.press(KeyCode::Enter);
+        assert_eq!(harness.state().layout.agents, !before);
+        assert!(harness.state().palette.is_none(), "the palette closes");
+    }
+
+    #[test]
+    fn escape_closes_the_palette_without_running_anything() {
+        let mut harness = harness();
+        harness.press_with(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let before = harness.state().layout.agents;
+        harness.press(KeyCode::Esc);
+        assert!(harness.state().palette.is_none());
+        assert_eq!(harness.state().layout.agents, before);
+    }
+
+    #[test]
+    fn a_confirmation_dialog_gates_destructive_actions() {
+        let mut harness = harness();
+        let path = harness.fixture.dir.path().join("README.md");
+        harness.state().reveal_in_explorer(&path);
+        harness.state().focus = FocusTarget::Explorer;
+
+        harness.press(KeyCode::Char('d'));
+        assert!(
+            matches!(harness.state().modal, Some(Modal::Confirm { .. })),
+            "delete must ask first"
+        );
+
+        // Declining leaves the file alone.
+        harness.press(KeyCode::Char('n'));
+        assert!(harness.state().modal.is_none());
+        assert!(path.exists());
+
+        // Confirming deletes it.
+        harness.press(KeyCode::Char('d'));
+        harness.press(KeyCode::Char('y'));
+        assert!(!path.exists(), "the file should be gone");
+    }
+
+    #[test]
+    fn prompts_collect_text_and_can_be_cancelled() {
+        let mut harness = harness();
+        harness.state().focus = FocusTarget::Explorer;
+
+        // New files land in the selected folder, which is `src/` here.
+        let target = harness.fixture.dir.path().join("src");
+
+        harness.press(KeyCode::Char('a')); // new file
+        assert!(matches!(harness.state().modal, Some(Modal::Prompt { .. })));
+        harness.type_text("notes.txt");
+        harness.press(KeyCode::Backspace);
+        harness.press(KeyCode::Esc);
+        assert!(harness.state().modal.is_none());
+        assert!(
+            !target.join("notes.tx").exists(),
+            "cancelling creates nothing"
+        );
+
+        harness.press(KeyCode::Char('a'));
+        harness.type_text("notes.txt");
+        harness.press(KeyCode::Enter);
+        assert!(
+            target.join("notes.txt").exists(),
+            "the file should have been created in the selected folder"
+        );
+        assert!(
+            harness.state().active_document().is_some(),
+            "a new file opens in the editor"
+        );
+    }
+
+    #[test]
+    fn a_focused_terminal_keeps_ordinary_keys_but_not_global_chords() {
+        let mut harness = harness();
+        let id = {
+            let mut terminals = harness.fixture.terminals.lock().unwrap();
+            terminals
+                .spawn_shell("cat", &[], harness.fixture.dir.path())
+                .unwrap()
+        };
+        harness.state().focus_terminal(id);
+
+        // A plain key belongs to the child: focus must not change.
+        harness.press(KeyCode::Char('e'));
+        assert_eq!(harness.state().focus, FocusTarget::Terminal(id));
+        harness.press(KeyCode::Char('j'));
+        assert_eq!(harness.state().focus, FocusTarget::Terminal(id));
+
+        // Global chords still reach the workbench.
+        harness.press_with(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(harness.state().focus, FocusTarget::CommandPalette);
+        harness.press(KeyCode::Esc);
+
+        // And so does the prefix.
+        harness.prefix(KeyCode::Char('e'));
+        assert_eq!(harness.state().focus, FocusTarget::Explorer);
+
+        harness.fixture.terminals.lock().unwrap().shutdown();
+    }
+
+    #[test]
+    fn completion_popup_keys_accept_an_item() {
+        let mut harness = harness();
+        harness.open_main();
+        let id = harness.state().active_tab.unwrap();
+        harness.state().focus = FocusTarget::Editor(id);
+        harness
+            .state()
+            .document_mut(id)
+            .unwrap()
+            .buffer
+            .move_to(crate::domain::diagnostics::Position::new(1, 8), false);
+
+        harness.state().completion = Some(crate::app::state::CompletionPopup {
+            items: vec![
+                crate::services::lsp::CompletionItem {
+                    label: "alpha".into(),
+                    detail: None,
+                    insert_text: "alpha()".into(),
+                    kind: None,
+                },
+                crate::services::lsp::CompletionItem {
+                    label: "beta".into(),
+                    detail: None,
+                    insert_text: "beta()".into(),
+                    kind: None,
+                },
+            ],
+            selected: 0,
+            position: crate::domain::diagnostics::Position::new(1, 8),
+            prefix: String::new(),
+        });
+
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::Enter);
+        assert!(harness.state().completion.is_none(), "the popup closes");
+        let line = harness
+            .state()
+            .active_document()
+            .unwrap()
+            .buffer
+            .line(1)
+            .to_string();
+        assert!(line.contains("beta()"), "{line}");
+    }
+
+    #[test]
+    fn escape_dismisses_the_hover_popup() {
+        let mut harness = harness();
+        harness.open_main();
+        harness.state().focus = FocusTarget::Editor(harness.state().active_tab.unwrap());
+        harness.state().hover = Some(crate::app::state::HoverPopup {
+            lines: vec!["fn main()".into()],
+            position: crate::domain::diagnostics::Position::new(0, 3),
+        });
+        harness.press(KeyCode::Esc);
+        assert!(harness.state().hover.is_none());
+    }
+
+    #[test]
+    fn clicking_focuses_the_panel_under_the_pointer() {
+        let mut harness = harness();
+        harness.open_main();
+
+        let mut layout = WorkbenchLayout::default();
+        layout.explorer = Some(ratatui::layout::Rect::new(0, 1, 30, 20));
+        layout.agents = Some(ratatui::layout::Rect::new(120, 1, 40, 20));
+
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            &mut harness.fixture.state,
+            &mut harness.services.services,
+            click(5, 5),
+            &layout,
+        );
+        assert_eq!(harness.fixture.state.focus, FocusTarget::Explorer);
+
+        handle_mouse(
+            &mut harness.fixture.state,
+            &mut harness.services.services,
+            click(130, 5),
+            &layout,
+        );
+        assert_eq!(harness.fixture.state.focus, FocusTarget::AgentList);
+
+        // A click on empty chrome changes nothing.
+        handle_mouse(
+            &mut harness.fixture.state,
+            &mut harness.services.services,
+            click(60, 40),
+            &layout,
+        );
+        assert_eq!(harness.fixture.state.focus, FocusTarget::AgentList);
+    }
+
+    #[test]
+    fn scrolling_moves_the_selection_under_the_pointer() {
+        let mut harness = harness();
+        harness
+            .fixture
+            .state
+            .tree
+            .expand(&harness.fixture.state.workspace.root.join("src"));
+
+        let mut layout = WorkbenchLayout::default();
+        layout.explorer = Some(ratatui::layout::Rect::new(0, 1, 30, 20));
+
+        let scroll = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(
+            &mut harness.fixture.state,
+            &mut harness.services.services,
+            scroll,
+            &layout,
+        );
+        assert!(
+            harness.fixture.state.explorer.selected > 0,
+            "the explorer selection should have moved"
+        );
+    }
+}

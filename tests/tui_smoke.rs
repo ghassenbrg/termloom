@@ -2,31 +2,76 @@
 //! drive it with keystrokes, the way a user would.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize};
 
+/// A workspace on disk plus an isolated HOME, reusable across restarts.
+struct Fixture {
+    dir: tempfile::TempDir,
+    home: tempfile::TempDir,
+}
+
+impl Fixture {
+    /// A plain project directory.
+    fn new() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+        Fixture {
+            dir,
+            // Config/state must live outside the workspace, or they would show
+            // up in the explorer and shift the rows these tests navigate.
+            home: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// A git repository with one commit and one uncommitted change.
+    fn git_repo() -> Fixture {
+        let fixture = Fixture::new();
+        let root = fixture.dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("notes.txt"), "first\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        // Leave a working-tree change for the Git panel to show.
+        std::fs::write(root.join("notes.txt"), "first\nsecond\n").unwrap();
+        fixture
+    }
+
+    /// Launch TermLoom against this workspace.
+    fn start(&self) -> Harness {
+        Harness::start(self.dir.path(), self.home.path())
+    }
+}
+
 /// A running TermLoom under our own pty, with its screen parsed by vt100.
 struct Harness {
-    _dir: tempfile::TempDir,
-    _home: tempfile::TempDir,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 impl Harness {
-    fn start() -> Harness {
-        let dir = tempfile::tempdir().unwrap();
-        // Config/state must live outside the workspace, or they would show up
-        // in the explorer and shift the rows this test navigates.
-        let home = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
-
+    fn start(root: &Path, home: &Path) -> Harness {
         let pty = portable_pty::native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -42,14 +87,14 @@ impl Harness {
         command.cwd(root);
         command.env("TERM", "xterm-256color");
         // Keep the app's own state out of the developer's real config.
-        command.env("HOME", home.path().to_string_lossy().to_string());
+        command.env("HOME", home.to_string_lossy().to_string());
         command.env(
             "XDG_CONFIG_HOME",
-            home.path().join("config").to_string_lossy().to_string(),
+            home.join("config").to_string_lossy().to_string(),
         );
         command.env(
             "XDG_STATE_HOME",
-            home.path().join("state").to_string_lossy().to_string(),
+            home.join("state").to_string_lossy().to_string(),
         );
 
         let child = pair.slave.spawn_command(command).unwrap();
@@ -71,8 +116,6 @@ impl Harness {
         });
 
         Harness {
-            _dir: dir,
-            _home: home,
             writer,
             parser,
             child,
@@ -132,7 +175,8 @@ impl Drop for Harness {
 
 #[test]
 fn opens_browses_runs_a_terminal_and_quits() {
-    let mut app = Harness::start();
+    let fixture = Fixture::new();
+    let mut app = fixture.start();
 
     // 1. The workbench comes up on a real repository.
     assert!(
@@ -189,7 +233,8 @@ fn opens_browses_runs_a_terminal_and_quits() {
 
 #[test]
 fn starts_outside_a_git_repository_and_survives_resize() {
-    let mut app = Harness::start();
+    let fixture = Fixture::new();
+    let mut app = fixture.start();
     assert!(app.wait_for("EXPLORER"), "{}", app.screen());
     // Resizing the pty must not crash the workbench.
     app.send(b"\x00");
@@ -197,4 +242,77 @@ fn starts_outside_a_git_repository_and_survives_resize() {
     assert!(app.wait_for("EDITOR"), "{}", app.screen());
     app.send(b"\x11");
     assert!(app.wait_exit(), "app did not exit:\n{}", app.screen());
+}
+
+#[test]
+fn restores_open_files_after_a_restart() {
+    let fixture = Fixture::new();
+
+    // First run: open a file and quit cleanly.
+    let mut app = fixture.start();
+    assert!(app.wait_for("EXPLORER"), "{}", app.screen());
+    app.send(b"\x1b[B"); // Down to README.md
+    app.send(b"\r");
+    assert!(app.wait_for("# demo"), "{}", app.screen());
+    app.send(b"\x11"); // Ctrl+Q
+    assert!(app.wait_exit(), "{}", app.screen());
+
+    // Second run: the workspace state brings the file back.
+    let mut app = fixture.start();
+    assert!(
+        app.wait_for("README.md"),
+        "the tab should be restored:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.wait_for("# demo"),
+        "the file contents should be restored:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.wait_for("restored"),
+        "the restore should be reported:\n{}",
+        app.screen()
+    );
+    app.send(b"\x11");
+    assert!(app.wait_exit(), "{}", app.screen());
+}
+
+#[test]
+fn shows_and_stages_a_git_change() {
+    let fixture = Fixture::git_repo();
+    let mut app = fixture.start();
+
+    // The Git panel picks the change up on its own refresh.
+    assert!(
+        app.wait_for("notes.txt"),
+        "the changed file should appear in the Git panel:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.screen().contains(" M notes.txt") || app.screen().contains("M notes.txt"),
+        "the worktree status should be shown:\n{}",
+        app.screen()
+    );
+
+    // Focus the Git panel and stage the selected file.
+    app.send(b"\x00"); // Ctrl+Space
+    app.send(b"g");
+    app.send(b"s");
+    assert!(
+        app.wait_for("M  notes.txt"),
+        "staging should move the change into the index:\n{}",
+        app.screen()
+    );
+
+    // Unstage it again.
+    app.send(b"u");
+    assert!(
+        app.wait_for(" M notes.txt"),
+        "unstaging should return it to the worktree:\n{}",
+        app.screen()
+    );
+
+    app.send(b"\x11");
+    assert!(app.wait_exit(), "{}", app.screen());
 }

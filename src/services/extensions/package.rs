@@ -284,8 +284,22 @@ pub(crate) fn validate_archive<R: std::io::Read + std::io::Seek>(
     Ok(entries)
 }
 
+/// Archive entry name for a manifest-relative asset path.
+///
+/// Manifest paths are usually written as `./syntaxes/x.json`; ZIP lookups are
+/// literal, so the `.` components are dropped here rather than at each call
+/// site.
 pub(crate) fn archive_asset_path(asset: &Path) -> Option<PathBuf> {
-    safe_relative(asset).then(|| Path::new("extension").join(asset))
+    if !safe_relative(asset) {
+        return None;
+    }
+    let mut path = PathBuf::from("extension");
+    for component in asset.components() {
+        if let Component::Normal(part) = component {
+            path.push(part);
+        }
+    }
+    Some(path)
 }
 
 #[cfg(test)]
@@ -296,6 +310,20 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::*;
+
+    #[test]
+    fn manifest_paths_with_a_leading_dot_resolve_to_archive_entries() {
+        // Real manifests write "./syntaxes/x.json"; ZIP lookups are literal.
+        assert_eq!(
+            archive_asset_path(Path::new("./syntaxes/x.json")).unwrap(),
+            PathBuf::from("extension/syntaxes/x.json")
+        );
+        assert_eq!(
+            archive_asset_path(Path::new("syntaxes/x.json")).unwrap(),
+            PathBuf::from("extension/syntaxes/x.json")
+        );
+        assert!(archive_asset_path(Path::new("../escape.json")).is_none());
+    }
 
     #[test]
     fn inspects_a_real_vsix_without_running_entrypoint() {

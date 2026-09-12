@@ -109,3 +109,63 @@ impl Services {
         });
     }
 }
+
+#[cfg(test)]
+pub use test_support::TestServices;
+
+#[cfg(test)]
+mod test_support {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::config::Config;
+    use crate::services::agents::LocalAgentBackend;
+    use crate::services::lsp::{LspManager, LspSink};
+    use crate::services::terminal::{EventSink, TerminalManager};
+
+    use super::*;
+
+    /// Services wired for tests: real local agent backend, no language server
+    /// processes, and an event channel the test can drain.
+    pub struct TestServices {
+        pub services: Services,
+        pub terminals: Arc<std::sync::Mutex<TerminalManager>>,
+        pub events: std::sync::mpsc::Receiver<AppEvent>,
+    }
+
+    impl Services {
+        /// Build services suitable for unit tests.
+        pub fn for_test(config: &Config, root: &Path) -> TestServices {
+            let (sender, events) = std::sync::mpsc::channel();
+            let terminal_sender = sender.clone();
+            let sink: EventSink = Arc::new(move |event| {
+                let app_event = match event {
+                    crate::services::terminal::TerminalEvent::Output(id) => {
+                        AppEvent::TerminalOutput(id)
+                    }
+                    crate::services::terminal::TerminalEvent::Exited(id, code) => {
+                        AppEvent::TerminalExited(id, code)
+                    }
+                };
+                let _ = terminal_sender.send(app_event);
+            });
+            let terminals = Arc::new(std::sync::Mutex::new(TerminalManager::new(sink)));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let lsp_sink: LspSink = Arc::new(|_| {});
+            let lsp = LspManager::new(config, root, lsp_sink);
+            let mut services = Services::new(sender, runtime, lsp);
+            services.agents.push(Arc::new(LocalAgentBackend::new(
+                Arc::clone(&terminals),
+                std::time::Duration::from_secs(20),
+            )));
+            TestServices {
+                services,
+                terminals,
+                events,
+            }
+        }
+    }
+}
